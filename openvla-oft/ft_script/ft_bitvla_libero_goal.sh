@@ -1,5 +1,5 @@
 torchrun --standalone --nnodes 1 --nproc-per-node 4 ../vla-scripts/finetune_bitnet.py \
-  --vla_path /path/to/lxsy/BitVLA-pretrain-200k \
+  --vla_path /path/to/BitVLA-pretrain-200k \
   --data_root_dir /path/to/modified_libero_rlds/ \
   --dataset_name libero_goal_no_noops \
   --run_root_dir /path/to/save/your/ckpt \
