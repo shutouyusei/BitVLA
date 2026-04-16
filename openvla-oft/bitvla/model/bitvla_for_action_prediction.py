@@ -1,5 +1,9 @@
 from transformers import LlavaForConditionalGeneration,PretrainedConfig
-from configuration_bit_vla import Bitvla_Config
+try:
+    from configuration_bit_vla import Bitvla_Config
+except ImportError:
+    import importlib
+    Bitvla_Config = importlib.import_module("bitvla.configuration_bit_vla").Bitvla_Config
 import numpy as np
 import torch
 from prismatic.vla.constants import (
