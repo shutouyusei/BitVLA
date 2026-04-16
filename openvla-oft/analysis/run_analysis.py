@@ -27,11 +27,13 @@ sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from analysis.extract_attention import extract_attention_maps, get_image_token_attention
+from analysis.extract_hidden_states import extract_hidden_states, get_token_types
 from analysis.visualize_attention import (
     compare_attention_maps,
     visualize_all_layers,
     visualize_attention_on_image,
 )
+from analysis.visualize_tsne import compare_tsne, overlay_tsne
 from bitvla.constants import BITNET_DEFAULT_IMAGE_TOKEN_IDX
 from int2_quantizer import quantize_bitlinear_layers
 
@@ -216,9 +218,26 @@ def run_attention_analysis(
             image_token_idx=BITNET_DEFAULT_IMAGE_TOKEN_IDX,
         )
 
+        # Extract hidden states for t-SNE
+        print(f"Extracting hidden states...")
+        hidden_states = extract_hidden_states(model, inputs, layer_indices=layer_indices)
+
+        from bitvla.constants import (
+            BITNET_PROPRIO_PAD_IDX,
+            BITNET_ACTION_TOKEN_BEGIN_IDX,
+        )
+        token_types = get_token_types(
+            inputs["input_ids"],
+            image_token_idx=BITNET_DEFAULT_IMAGE_TOKEN_IDX,
+            proprio_pad_idx=BITNET_PROPRIO_PAD_IDX,
+            action_token_begin_idx=BITNET_ACTION_TOKEN_BEGIN_IDX,
+        )
+
         results[label] = {
             "image": np.array(image),
             "attention": image_attention,
+            "hidden_states": hidden_states,
+            "token_types": token_types,
             "task_description": task_description,
             "task_name": task_name,
         }
@@ -244,6 +263,25 @@ def run_attention_analysis(
                     task_label=results["original"]["task_description"],
                     output_path=os.path.join(output_dir, f"compare_layer{layer_idx}_task{task_id}.png"),
                 )
+
+    # t-SNE comparison if we have both original and perturbed
+    if "original" in results and "perturbed" in results:
+        print("\nGenerating t-SNE visualizations...")
+        compare_tsne(
+            results["original"]["hidden_states"],
+            results["perturbed"]["hidden_states"],
+            results["original"]["token_types"],
+            results["perturbed"]["token_types"],
+            task_label=results["original"]["task_description"],
+            output_path=os.path.join(output_dir, f"tsne_compare_task{task_id}.png"),
+        )
+        overlay_tsne(
+            results["original"]["hidden_states"],
+            results["perturbed"]["hidden_states"],
+            results["original"]["token_types"],
+            task_label=results["original"]["task_description"],
+            output_path=os.path.join(output_dir, f"tsne_overlay_task{task_id}.png"),
+        )
 
     print(f"\nAll visualizations saved to: {output_dir}")
 
