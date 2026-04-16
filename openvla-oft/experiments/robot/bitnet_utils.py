@@ -30,6 +30,7 @@ from experiments.robot.openvla_utils import (
 DEVICE = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
 BITNET_VLA_IMAGE_SIZE = 224
 from bitvla.dataset.bitvla_transform import llava_to_openai
+from transformers.models.llava.modeling_bitnet import BitLinear
 
 
 
@@ -65,19 +66,28 @@ def get_bitnet_vla(cfg: Any) -> torch.nn.Module:
             where_to_find_files_cur_codebase="./bitvla")
 
     # Load the model
+    use_int2 = getattr(cfg, "use_int2_quantization", False)
     vla = AutoModelForVision2Seq.from_pretrained(
         cfg.pretrained_checkpoint,
         torch_dtype=torch.bfloat16,
-        load_in_8bit=cfg.load_in_8bit,
-        load_in_4bit=cfg.load_in_4bit,
+        load_in_8bit=cfg.load_in_8bit if not use_int2 else False,
+        load_in_4bit=cfg.load_in_4bit if not use_int2 else False,
         trust_remote_code=True,
+        low_cpu_mem_usage=True if use_int2 else False,
     )
 
-    vla.eval()
-
-    # Move model to device if not using quantization
-    if not cfg.load_in_8bit and not cfg.load_in_4bit:
+    if use_int2:
+        count = 0
+        for name, module in vla.named_modules():
+            if isinstance(module, BitLinear) and not module.enable_qlora:
+                module.quantize_weights()
+                count += 1
+        print(f"Offline-quantized {count} BitLinear layers to 2-bit")
         vla = vla.to(DEVICE)
+    elif not cfg.load_in_8bit and not cfg.load_in_4bit:
+        vla = vla.to(DEVICE)
+
+    vla.eval()
 
     # Load dataset stats for action normalization
     _load_dataset_stats(vla, cfg.pretrained_checkpoint)

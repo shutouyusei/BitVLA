@@ -109,6 +109,7 @@ class GenerateConfig:
 
     load_in_8bit: bool = False                       # (For OpenVLA only) Load with 8-bit quantization
     load_in_4bit: bool = False                       # (For OpenVLA only) Load with 4-bit quantization
+    use_int2_quantization: bool = False              # Offline-quantize BitLinear layers to 2-bit packed format
 
     #################################################################################################################
     # LIBERO environment-specific parameters
