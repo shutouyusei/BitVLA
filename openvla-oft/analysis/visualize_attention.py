@@ -2,14 +2,10 @@
 Attention map visualization for BitVLA models.
 
 Overlays attention heatmaps on input images to show where the model focuses.
-Supports side-by-side comparison (e.g., original vs perturbed).
+Supports single image, side-by-side comparison, and multi-layer grid views.
 
 Usage:
-    python visualize_attention.py \
-        --checkpoint_path /path/to/bitvla \
-        --image_path /path/to/image.png \
-        --task_label "pick up the black bowl" \
-        --output_path attention_map.png
+    from analysis.visualize_attention import visualize_attention_on_image, compare_attention_maps
 """
 
 import argparse

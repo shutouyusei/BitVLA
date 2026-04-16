@@ -38,7 +38,7 @@ from bitvla.constants import BITNET_DEFAULT_IMAGE_TOKEN_IDX
 from int2_quantizer import quantize_bitlinear_layers
 
 
-DEVICE = torch.device("cpu")  # Use CPU to avoid VRAM conflicts with other processes
+DEVICE = torch.device("cpu")  # Default to CPU; override with --device cuda:0 for GPU
 
 
 def load_model(checkpoint_path, use_int2=False):
@@ -104,15 +104,20 @@ def get_libero_observation(task_suite_name, task_id=0, seed=7):
     task_description = task.language
 
     initial_states = task_suite.get_task_init_states(task_id)
+    if not initial_states:
+        raise RuntimeError(
+            f"No initial states found for task {task_id} in suite '{task_suite_name}'. "
+            f"The LIBERO benchmark data may not be properly installed."
+        )
     env, _ = get_libero_env(task, model_family="bitnet", resolution=256)
-    env.seed(seed)
-    env.reset()
-    env.set_init_state(initial_states[0])
-    obs = env.step(np.zeros(7))[0]
-
-    image = get_libero_image(obs)
-
-    env.close()
+    try:
+        env.seed(seed)
+        env.reset()
+        env.set_init_state(initial_states[0])
+        obs = env.step(np.zeros(7))[0]
+        image = get_libero_image(obs)
+    finally:
+        env.close()
     return image, task_description, task_name
 
 
@@ -300,11 +305,21 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, default="./analysis_output")
     parser.add_argument("--use_int2_quantization", action="store_true")
     parser.add_argument("--layers", type=int, nargs="*", default=None, help="Layer indices to analyze")
+    parser.add_argument("--device", type=str, default="cpu", help="Device: cpu or cuda:0 (default: cpu)")
     args = parser.parse_args()
+
+    global DEVICE
+    DEVICE = torch.device(args.device)
 
     task_suites = {}
     for ts in args.task_suite:
-        label, suite_name = ts.split(":")
+        parts = ts.split(":")
+        if len(parts) != 2:
+            parser.error(
+                f"Invalid --task_suite format: '{ts}'. "
+                f"Expected 'label:suite_name' (e.g., 'original:libero_spatial')"
+            )
+        label, suite_name = parts
         task_suites[label] = suite_name
 
     run_attention_analysis(

@@ -2,7 +2,11 @@
 Attention map extraction for BitVLA models.
 
 Registers forward hooks on BitNetAttention layers to capture attention weights
-during inference, without modifying the model code.
+during inference. Temporarily mutates model config to enable output_attentions;
+restores the original values after extraction.
+
+Note: If the model uses FlashAttention2, attention weights may not be captured.
+The model must use eager attention for this extraction to work.
 
 Usage:
     from analysis.extract_attention import extract_attention_maps
@@ -21,9 +25,12 @@ def extract_attention_maps(
     """
     Run forward pass with hooks to capture attention weights from BitNetAttention layers.
 
-    Uses register_forward_hook on each attention layer to intercept the returned
-    attn_weights tensor. This avoids modifying model code or using output_attentions=True
-    which may not propagate correctly through all model wrappers.
+    Uses register_forward_pre_hook to force output_attentions=True on each
+    individual attention layer, and a post-hook to capture the returned
+    attn_weights tensor. This two-hook approach ensures attention weights
+    are captured even when the model's top-level forward does not propagate the flag.
+
+    Assumes batch_size=1. The batch dimension is squeezed from the output.
 
     Args:
         model: BitVLA model (on GPU, eval mode)
@@ -44,34 +51,35 @@ def extract_attention_maps(
     if layer_indices is None:
         layer_indices = list(range(len(attn_layers)))
 
+    if not attn_layers:
+        raise RuntimeError(
+            f"No BitNetAttention layers found in the model. "
+            f"Model type: {type(model).__name__}"
+        )
+
+    for idx in layer_indices:
+        if idx >= len(attn_layers):
+            raise ValueError(
+                f"Layer index {idx} out of range. Model has {len(attn_layers)} "
+                f"attention layers (0-{len(attn_layers)-1})."
+            )
+
     # Storage for captured attention weights
     captured = {}
     hooks = []
 
-    def make_hook(layer_idx):
-        def hook_fn(module, input, output):
-            # BitNetAttention.forward returns (attn_output, attn_weights, past_key_value)
-            # attn_weights is None when output_attentions=False, so we need to
-            # temporarily enable it
-            pass
-        return hook_fn
-
-    # We need output_attentions=True for the model to return attention weights.
-    # Override at the config level temporarily.
-    original_output_attentions = model.config.output_attentions
+    # Override output_attentions at the config level temporarily
+    original_output_attentions = getattr(model.config, "output_attentions", False)
     model.config.output_attentions = True
 
-    # Also set on text_config if it exists (nested config for LLaVA models)
     original_text_output_attentions = None
     if hasattr(model.config, "text_config"):
         original_text_output_attentions = model.config.text_config.output_attentions
         model.config.text_config.output_attentions = True
 
-    # We use a pre-hook to force output_attentions=True in the attention forward args,
-    # and a post-hook to capture the returned attention weights.
+    # Pre-hook forces output_attentions=True per-layer; post-hook captures the weights
     def make_pre_hook():
         def hook_fn(module, args, kwargs):
-            # BitNetAttention.forward signature includes output_attentions as a kwarg
             kwargs["output_attentions"] = True
             return args, kwargs
         return hook_fn
@@ -84,33 +92,41 @@ def extract_attention_maps(
         return hook_fn
 
     for idx in layer_indices:
-        if idx < len(attn_layers):
-            name, module = attn_layers[idx]
-            pre_hook = module.register_forward_pre_hook(make_pre_hook(), with_kwargs=True)
-            post_hook = module.register_forward_hook(make_capture_hook(idx))
-            hooks.append(pre_hook)
-            hooks.append(post_hook)
+        name, module = attn_layers[idx]
+        pre_hook = module.register_forward_pre_hook(make_pre_hook(), with_kwargs=True)
+        post_hook = module.register_forward_hook(make_capture_hook(idx))
+        hooks.append(pre_hook)
+        hooks.append(post_hook)
 
-    # Run a single forward pass with dummy labels to avoid the labels=None issue.
-    # We create fake labels (all -100 = ignored) so the forward pass runs
-    # through the full pipeline but doesn't compute any action loss.
-    import copy
-    fwd_inputs = copy.copy(inputs)
-    seq_len = fwd_inputs["input_ids"].shape[1]
-    fwd_inputs["labels"] = torch.full(
-        (1, seq_len), -100, dtype=torch.long, device=fwd_inputs["input_ids"].device
-    )
-    with torch.inference_mode():
-        model(**fwd_inputs)
+    try:
+        # Forward pass with dummy labels (all -100 = ignored) to avoid labels=None issue
+        import copy
+        fwd_inputs = copy.copy(inputs)
+        seq_len = fwd_inputs["input_ids"].shape[1]
+        fwd_inputs["labels"] = torch.full(
+            (1, seq_len), -100, dtype=torch.long, device=fwd_inputs["input_ids"].device
+        )
+        with torch.inference_mode():
+            model(**fwd_inputs)
+    finally:
+        for hook in hooks:
+            hook.remove()
+        model.config.output_attentions = original_output_attentions
+        if original_text_output_attentions is not None:
+            model.config.text_config.output_attentions = original_text_output_attentions
 
-    # Clean up hooks and restore config
-    for hook in hooks:
-        hook.remove()
-    model.config.output_attentions = original_output_attentions
-    if original_text_output_attentions is not None:
-        model.config.text_config.output_attentions = original_text_output_attentions
+    if not captured:
+        raise RuntimeError(
+            f"No attention weights captured from {len(layer_indices)} requested layers. "
+            f"The model may use FlashAttention2 which does not return attention weights. "
+            f"Ensure the model uses eager attention."
+        )
 
-    # Squeeze batch dimension (assuming batch_size=1)
+    missing = set(layer_indices) - set(captured.keys())
+    if missing:
+        print(f"WARNING: Failed to capture attention from layers {sorted(missing)}")
+
+    # Squeeze batch dimension
     result = {}
     for layer_idx, attn in captured.items():
         result[layer_idx] = attn.squeeze(0)  # (num_heads, seq_len, seq_len)

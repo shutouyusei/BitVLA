@@ -41,8 +41,21 @@ def extract_hidden_states(
         if isinstance(module, BitNetDecoderLayer):
             decoder_layers.append((name, module))
 
+    if not decoder_layers:
+        raise RuntimeError(
+            f"No BitNetDecoderLayer found in the model. "
+            f"Model type: {type(model).__name__}"
+        )
+
     if layer_indices is None:
         layer_indices = list(range(len(decoder_layers)))
+
+    for idx in layer_indices:
+        if idx >= len(decoder_layers):
+            raise ValueError(
+                f"Layer index {idx} out of range. Model has {len(decoder_layers)} "
+                f"decoder layers (0-{len(decoder_layers)-1})."
+            )
 
     captured = {}
     hooks = []
@@ -55,23 +68,27 @@ def extract_hidden_states(
         return hook_fn
 
     for idx in layer_indices:
-        if idx < len(decoder_layers):
-            name, module = decoder_layers[idx]
-            hook = module.register_forward_hook(make_capture_hook(idx))
-            hooks.append(hook)
+        name, module = decoder_layers[idx]
+        hook = module.register_forward_hook(make_capture_hook(idx))
+        hooks.append(hook)
 
-    # Run forward pass with dummy labels
-    import copy
-    fwd_inputs = copy.copy(inputs)
-    seq_len = fwd_inputs["input_ids"].shape[1]
-    fwd_inputs["labels"] = torch.full(
-        (1, seq_len), -100, dtype=torch.long, device=fwd_inputs["input_ids"].device
-    )
-    with torch.inference_mode():
-        model(**fwd_inputs)
+    try:
+        import copy
+        fwd_inputs = copy.copy(inputs)
+        seq_len = fwd_inputs["input_ids"].shape[1]
+        fwd_inputs["labels"] = torch.full(
+            (1, seq_len), -100, dtype=torch.long, device=fwd_inputs["input_ids"].device
+        )
+        with torch.inference_mode():
+            model(**fwd_inputs)
+    finally:
+        for hook in hooks:
+            hook.remove()
 
-    for hook in hooks:
-        hook.remove()
+    if not captured:
+        raise RuntimeError(
+            f"No hidden states captured from {len(layer_indices)} requested layers."
+        )
 
     return captured
 
@@ -92,18 +109,22 @@ def get_token_types(
         action_token_begin_idx: token ID marking start of action tokens
 
     Returns:
-        list of token type strings: "image", "text", "proprio", "action", "special"
+        list of token type strings: "image", "text", "proprio", or "action"
     """
     if input_ids.dim() == 2:
         input_ids = input_ids.squeeze(0)
 
+    # Note: proprio check must come before action check because
+    # proprio_pad_idx == action_token_begin_idx (both 128011).
+    # The single proprio sentinel is classified first; tokens with
+    # IDs > action_token_begin_idx are classified as action.
     token_types = []
     for tid in input_ids.tolist():
         if tid == image_token_idx:
             token_types.append("image")
         elif tid == proprio_pad_idx:
             token_types.append("proprio")
-        elif tid >= action_token_begin_idx:
+        elif tid > action_token_begin_idx:
             token_types.append("action")
         else:
             token_types.append("text")

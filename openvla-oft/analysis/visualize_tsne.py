@@ -3,13 +3,10 @@ t-SNE visualization of BitVLA hidden state representations.
 
 Projects token embeddings from different layers to 2D, colored by token type
 (image, text, action). Compares original vs perturbed to reveal
-representation collapse.
+representation divergence under perturbation.
 
 Usage:
-    python visualize_tsne.py \
-        --checkpoint_path /path/to/bitvla \
-        --task_suite original:libero_spatial perturbed:libero_spatial_swap \
-        --output_dir ./analysis_output
+    from analysis.visualize_tsne import compare_tsne, overlay_tsne
 """
 
 import math
@@ -29,7 +26,6 @@ TOKEN_COLORS = {
     "text": "#4CAF50",     # green
     "proprio": "#FF9800",  # orange
     "action": "#F44336",   # red
-    "special": "#9E9E9E",  # gray
 }
 
 
@@ -48,7 +44,7 @@ def plot_tsne_single(
         token_types: list of token type strings per position
         ax: matplotlib axes
         title: subplot title
-        perplexity: t-SNE perplexity (lower = more local structure)
+        perplexity: t-SNE perplexity upper bound (lower = more local structure, auto-clamped for small sequences)
     """
     X = hidden_states.float().numpy()
     n_samples = X.shape[0]
@@ -100,6 +96,9 @@ def compare_tsne(
         perplexity: t-SNE perplexity
     """
     common_layers = sorted(set(hidden_original.keys()) & set(hidden_perturbed.keys()))
+    if not common_layers:
+        print("Warning: no common layers between original and perturbed, skipping t-SNE comparison")
+        return
     n_layers = len(common_layers)
 
     fig, axes = plt.subplots(n_layers, 2, figsize=(12, 5 * n_layers))
@@ -141,13 +140,16 @@ def overlay_tsne(
     Overlay t-SNE of original and perturbed on the same plot per layer.
 
     Original tokens are plotted as circles, perturbed as X markers.
-    If representations are robust, clusters should overlap.
-    If representations collapse, clusters will separate.
+    If representations are robust to perturbation, original and perturbed
+    clusters should overlap. If representations are sensitive to perturbation,
+    clusters will diverge.
 
     Args:
         hidden_original: dict layer_idx -> (seq_len, hidden_dim) for original
         hidden_perturbed: dict layer_idx -> (seq_len, hidden_dim) for perturbed
-        token_types: token type list (same structure assumed for both)
+        token_types: token type list (assumed identical for both inputs since
+            original and perturbed share the same prompt and tokenization;
+            only the pixel values differ)
         task_label: task description
         output_path: where to save
         perplexity: t-SNE perplexity
@@ -180,7 +182,10 @@ def overlay_tsne(
 
         # Plot image tokens only (most informative for visual grounding)
         img_mask = [j for j, t in enumerate(token_types) if t == "image"]
-        if img_mask and max(img_mask) < n_orig:
+        if img_mask and max(img_mask) >= n_orig:
+            print(f"Warning: token_types length ({len(token_types)}) exceeds hidden state length ({n_orig}) at layer {layer_idx}, skipping overlay")
+            continue
+        if img_mask:
             ax.scatter(
                 X_orig_2d[img_mask, 0], X_orig_2d[img_mask, 1],
                 c=TOKEN_COLORS["image"], marker="o", s=20, alpha=0.5, label="Original (image)",
