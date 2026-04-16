@@ -17,7 +17,7 @@ import torch
 from transformers import AutoModelForVision2Seq
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
-from transformers.models.llava.modeling_bitnet import BitLinear
+from int2_quantizer import quantize_bitlinear_layers
 
 
 def quantize_and_save(checkpoint_path: str, output_path: str) -> None:
@@ -25,13 +25,18 @@ def quantize_and_save(checkpoint_path: str, output_path: str) -> None:
     Load a BitVLA model in bf16, quantize all BitLinear layers
     to 2-bit packed format, and save the quantized model.
 
-    BitLinear.quantize_weights() does:
-    1. Pack bf16 weights into 2-bit (4 values per byte)
-    2. Store scale factor (w_step)
-    3. Delete original bf16 weight
+    Reduces weight memory by ~8x for BitLinear layers.
+    Non-BitLinear layers (embeddings, vision encoder, connector) remain in bf16.
 
-    This reduces ~5.7GB -> ~1.5GB on GPU.
+    Side effects: Writes quantized model weights and copies
+    tokenizer/processor files to output_path.
     """
+    if not os.path.isdir(checkpoint_path):
+        raise FileNotFoundError(
+            f"Checkpoint path does not exist or is not a directory: '{checkpoint_path}'"
+        )
+    os.makedirs(output_path, exist_ok=True)
+
     print(f"Loading model from: {checkpoint_path}")
     model = AutoModelForVision2Seq.from_pretrained(
         checkpoint_path,
@@ -41,24 +46,25 @@ def quantize_and_save(checkpoint_path: str, output_path: str) -> None:
     )
 
     print("Quantizing BitLinear layers...")
-    count = 0
-    for name, module in model.named_modules():
-        if isinstance(module, BitLinear) and not module.enable_qlora:
-            module.quantize_weights()
-            count += 1
-            print(f"  Quantized: {name}")
-
-    print(f"\nQuantized {count} BitLinear layers")
+    count = quantize_bitlinear_layers(model)
+    print(f"Quantized {count} BitLinear layers to 2-bit")
 
     print(f"Saving quantized model to: {output_path}")
     model.save_pretrained(output_path)
 
-    # Copy tokenizer and processor files
-    for f in os.listdir(checkpoint_path):
-        if f.endswith((".json", ".txt", ".model", ".py")) and not os.path.exists(
-            os.path.join(output_path, f)
-        ):
-            shutil.copy2(os.path.join(checkpoint_path, f), output_path)
+    # Copy tokenizer and processor files not already written by save_pretrained
+    try:
+        for f in os.listdir(checkpoint_path):
+            if f.endswith((".json", ".txt", ".model", ".py")) and not os.path.exists(
+                os.path.join(output_path, f)
+            ):
+                shutil.copy2(os.path.join(checkpoint_path, f), output_path)
+    except OSError as e:
+        print(
+            f"WARNING: Model weights saved successfully but failed to copy "
+            f"auxiliary files from '{checkpoint_path}': {e}"
+        )
+        print(f"You may need to manually copy tokenizer/processor files to '{output_path}'")
 
     print(f"Done! Saved to: {output_path}")
 

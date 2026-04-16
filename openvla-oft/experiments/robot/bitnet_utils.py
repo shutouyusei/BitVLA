@@ -30,7 +30,7 @@ from experiments.robot.openvla_utils import (
 DEVICE = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
 BITNET_VLA_IMAGE_SIZE = 224
 from bitvla.dataset.bitvla_transform import llava_to_openai
-from transformers.models.llava.modeling_bitnet import BitLinear
+from int2_quantizer import quantize_bitlinear_layers
 
 
 
@@ -77,12 +77,8 @@ def get_bitnet_vla(cfg: Any) -> torch.nn.Module:
     )
 
     if use_int2:
-        count = 0
-        for name, module in vla.named_modules():
-            if isinstance(module, BitLinear) and not module.enable_qlora:
-                module.quantize_weights()
-                count += 1
-        print(f"Offline-quantized {count} BitLinear layers to 2-bit")
+        count = quantize_bitlinear_layers(vla)
+        print(f"Quantized {count} BitLinear layers to 2-bit at load time")
         vla = vla.to(DEVICE)
     elif not cfg.load_in_8bit and not cfg.load_in_4bit:
         vla = vla.to(DEVICE)
