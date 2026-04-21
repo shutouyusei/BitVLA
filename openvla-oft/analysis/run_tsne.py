@@ -29,9 +29,13 @@ from bitvla.constants import (
 
 def analyze_condition(stack, label, suite, mode, task_id, layer_indices, capture_kwargs):
     print(f"\n{'=' * 60}\n[{label}] suite={suite} mode={mode} task={task_id}\n{'=' * 60}")
-    image, task_desc, task_name, _bboxes, meta = common.capture_observation(
-        suite, task_id, mode, stack=stack, **capture_kwargs
-    )
+    capture = common.capture_frames(suite, task_id, mode, stack=stack, **capture_kwargs)
+    # t-SNE analysis uses the t=0 frame only (Phase 1 design)
+    frame = capture["frames"]["t=0"]
+    image = frame["image"]
+    task_desc = capture["task_description"]
+    task_name = capture["task_name"]
+    meta = capture["meta"]
     inputs = common.prepare_inputs(stack.model, stack.processor, image, task_desc)
 
     print("Extracting hidden states...")
@@ -111,7 +115,6 @@ def main():
     capture_kwargs = dict(
         rollout_max_steps=args.rollout_max_steps,
         rollout_seed_candidates=tuple(args.rollout_seed_candidates),
-        mid_rollout_step=args.mid_rollout_step,
     )
 
     for label, suite, mode in conditions:

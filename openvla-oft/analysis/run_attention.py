@@ -30,31 +30,20 @@ from analysis.visualize_attention import visualize_all_layers
 from bitvla.constants import BITNET_DEFAULT_IMAGE_TOKEN_IDX
 
 
-def analyze_condition(stack, label, suite, mode, task_id, layer_indices, capture_kwargs,
-                      include_siglip=False, siglip_layer_indices=None):
-    print(f"\n{'=' * 60}\n[{label}] suite={suite} mode={mode} task={task_id}\n{'=' * 60}")
-    image, task_desc, task_name, bboxes, meta = common.capture_observation(
-        suite, task_id, mode, stack=stack, **capture_kwargs
-    )
+def analyze_frame(stack, image, task_desc, layer_indices, include_siglip, siglip_layer_indices):
     inputs = common.prepare_inputs(stack.model, stack.processor, image, task_desc)
 
-    print("Extracting LLM attention maps...")
     attention_maps = extract_attention_maps(stack.model, inputs, layer_indices=layer_indices)
     image_attention = get_image_token_attention(
-        attention_maps,
-        inputs["input_ids"],
-        image_token_idx=BITNET_DEFAULT_IMAGE_TOKEN_IDX,
+        attention_maps, inputs["input_ids"], image_token_idx=BITNET_DEFAULT_IMAGE_TOKEN_IDX,
     )
     image_attention_per_head = get_image_token_attention_per_head(
-        attention_maps,
-        inputs["input_ids"],
-        image_token_idx=BITNET_DEFAULT_IMAGE_TOKEN_IDX,
+        attention_maps, inputs["input_ids"], image_token_idx=BITNET_DEFAULT_IMAGE_TOKEN_IDX,
     )
 
     siglip_attention = None
     siglip_attention_per_head = None
     if include_siglip:
-        print("Extracting SigLIP attention maps...")
         siglip_maps = extract_siglip_attention_maps(
             stack.model, inputs, layer_indices=siglip_layer_indices
         )
@@ -62,16 +51,39 @@ def analyze_condition(stack, label, suite, mode, task_id, layer_indices, capture
         siglip_attention_per_head = get_siglip_patch_saliency_per_head(siglip_maps)
 
     return {
-        "label": label,
-        "image": np.array(image),
         "attention": image_attention,
         "attention_per_head": image_attention_per_head,
         "siglip_attention": siglip_attention,
         "siglip_attention_per_head": siglip_attention_per_head,
-        "bboxes": bboxes,
-        "task_description": task_desc,
-        "task_name": task_name,
-        "meta": meta,
+    }
+
+
+def analyze_condition(stack, label, suite, mode, task_id, layer_indices, capture_kwargs,
+                      include_siglip=False, siglip_layer_indices=None):
+    print(f"\n{'=' * 60}\n[{label}] suite={suite} mode={mode} task={task_id}\n{'=' * 60}")
+    capture = common.capture_frames(suite, task_id, mode, stack=stack, **capture_kwargs)
+
+    frame_results = {}
+    for frame_name, frame in capture["frames"].items():
+        print(f"  frame {frame_name} (step={frame['step_idx']}, fallback={frame.get('fallback', False)})")
+        attn = analyze_frame(
+            stack, frame["image"], capture["task_description"],
+            layer_indices, include_siglip, siglip_layer_indices,
+        )
+        frame_results[frame_name] = {
+            "step_idx": frame["step_idx"],
+            "fallback": frame.get("fallback", False),
+            "image": frame["image"],
+            "bboxes": frame["bboxes"],
+            **attn,
+        }
+
+    return {
+        "label": label,
+        "task_description": capture["task_description"],
+        "task_name": capture["task_name"],
+        "meta": capture["meta"],
+        "frames": frame_results,
     }
 
 
@@ -163,47 +175,58 @@ def compute_bbox_attention_ratios_per_head(image_attention_per_head, bboxes, ima
     return results
 
 
-def save_per_condition(result, png_dir, json_dir, task_id):
-    visualize_all_layers(
-        result["image"],
-        result["attention"],
-        task_label=f"{result['task_description']} [{result['label']}] (LLM)",
-        output_path=os.path.join(png_dir, f"layers_{result['label']}_task{task_id}.png"),
-        bboxes=result["bboxes"],
-    )
+def _frame_suffix(name):
+    """Safe filename tag for a frame key like 't=max//3'."""
+    return name.replace("/", "-").replace("=", "-")
 
-    ratios = compute_bbox_attention_ratios(
-        result["attention"], result["bboxes"], result["image"].shape
-    )
-    per_head_stats = compute_bbox_attention_ratios_per_head(
-        result["attention_per_head"], result["bboxes"], result["image"].shape
-    )
+
+def save_per_condition(result, png_dir, json_dir, task_id):
+    frames_payload = {}
+    for frame_name, fr in result["frames"].items():
+        tag = _frame_suffix(frame_name)
+        base_title = f"{result['task_description']} [{result['label']} / {frame_name}]"
+
+        visualize_all_layers(
+            fr["image"], fr["attention"],
+            task_label=f"{base_title} (LLM)",
+            output_path=os.path.join(png_dir, f"layers_{result['label']}_task{task_id}_{tag}.png"),
+            bboxes=fr["bboxes"],
+        )
+        ratios = compute_bbox_attention_ratios(fr["attention"], fr["bboxes"], fr["image"].shape)
+        per_head_stats = compute_bbox_attention_ratios_per_head(
+            fr["attention_per_head"], fr["bboxes"], fr["image"].shape
+        )
+        frame_entry = {
+            "step_idx": fr["step_idx"],
+            "fallback": fr["fallback"],
+            "bboxes": fr["bboxes"],
+            "per_layer_ratios_llm": ratios,
+            "per_layer_per_head_llm": per_head_stats,
+        }
+
+        if fr.get("siglip_attention"):
+            visualize_all_layers(
+                fr["image"], fr["siglip_attention"],
+                task_label=f"{base_title} (SigLIP)",
+                output_path=os.path.join(png_dir, f"layers_siglip_{result['label']}_task{task_id}_{tag}.png"),
+                bboxes=fr["bboxes"],
+            )
+            frame_entry["per_layer_ratios_siglip"] = compute_bbox_attention_ratios(
+                fr["siglip_attention"], fr["bboxes"], fr["image"].shape
+            )
+            frame_entry["per_layer_per_head_siglip"] = compute_bbox_attention_ratios_per_head(
+                fr["siglip_attention_per_head"], fr["bboxes"], fr["image"].shape
+            )
+
+        frames_payload[frame_name] = frame_entry
+
     payload = {
         "label": result["label"],
         "task_description": result["task_description"],
+        "task_name": result["task_name"],
         "meta": result["meta"],
-        "bboxes": result["bboxes"],
-        "per_layer_ratios_llm": ratios,
-        "per_layer_per_head_llm": per_head_stats,
+        "frames": frames_payload,
     }
-
-    if result.get("siglip_attention"):
-        visualize_all_layers(
-            result["image"],
-            result["siglip_attention"],
-            task_label=f"{result['task_description']} [{result['label']}] (SigLIP)",
-            output_path=os.path.join(png_dir, f"layers_siglip_{result['label']}_task{task_id}.png"),
-            bboxes=result["bboxes"],
-        )
-        siglip_ratios = compute_bbox_attention_ratios(
-            result["siglip_attention"], result["bboxes"], result["image"].shape
-        )
-        siglip_per_head = compute_bbox_attention_ratios_per_head(
-            result["siglip_attention_per_head"], result["bboxes"], result["image"].shape
-        )
-        payload["per_layer_ratios_siglip"] = siglip_ratios
-        payload["per_layer_per_head_siglip"] = siglip_per_head
-
     scores_path = os.path.join(json_dir, f"scores_{result['label']}_task{task_id}.json")
     with open(scores_path, "w") as f:
         json.dump(payload, f, indent=2)
@@ -245,7 +268,6 @@ def main():
     capture_kwargs = dict(
         rollout_max_steps=args.rollout_max_steps,
         rollout_seed_candidates=tuple(args.rollout_seed_candidates),
-        mid_rollout_step=args.mid_rollout_step,
     )
 
     for label, suite, mode in conditions:

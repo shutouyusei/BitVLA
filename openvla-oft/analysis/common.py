@@ -227,7 +227,6 @@ def add_common_args(parser):
                         help="Max env steps; None → use TASK_MAX_STEPS for the suite.")
     parser.add_argument("--rollout_seed_candidates", type=int, nargs="*",
                         default=[7, 13, 21, 42, 100])
-    parser.add_argument("--mid_rollout_step", type=int, default=50)
 
 
 def _get_task_and_init(suite_name, task_id):
@@ -312,8 +311,30 @@ def _reset_and_capture_initial(suite_name, task_id, seed):
     return image, task_description, task_name, bboxes
 
 
-def _run_rollout(stack: RolloutStack, suite_name, task_id, seed, max_steps, capture_step):
-    """Run a single rollout. Returns success flag + image/bbox pairs at the initial and capture frames."""
+PHASE1_CAPTURE_STEPS = {"t=0": 0, "t=max//3": None, "step=100": 100, "t=max-1": None}
+
+
+def _resolve_capture_steps(max_steps, override=None):
+    """Return concrete {frame_name: step_idx} for a given rollout length."""
+    steps = dict(override or PHASE1_CAPTURE_STEPS)
+    resolved = {}
+    for name, raw in steps.items():
+        if name == "t=max//3":
+            resolved[name] = max_steps // 3
+        elif name == "t=max-1":
+            resolved[name] = max_steps - 1
+        else:
+            resolved[name] = raw
+    return resolved
+
+
+def _run_rollout(stack: RolloutStack, suite_name, task_id, seed, max_steps, capture_steps):
+    """Run a rollout, collecting image+bbox at every requested frame.
+
+    capture_steps: dict {frame_name: step_idx}. Frames that the rollout never
+    reaches (rollout terminates early) are filled from the final captured
+    observation and tagged with fallback=True.
+    """
     from experiments.robot.libero.libero_utils import (
         get_libero_image,
         get_libero_dummy_action,
@@ -332,10 +353,8 @@ def _run_rollout(stack: RolloutStack, suite_name, task_id, seed, max_steps, capt
         max_steps = TASK_MAX_STEPS.get(suite_name, 220)
 
     env = _make_seg_env(task, resolution=256)
-    initial_image = None
-    initial_bboxes = []
-    capture_image = None
-    capture_bboxes = []
+    frames = {}
+    last_frame = None
     action_queue = deque(maxlen=cfg.num_open_loop_steps)
     success = False
     try:
@@ -350,15 +369,16 @@ def _run_rollout(stack: RolloutStack, suite_name, task_id, seed, max_steps, capt
                 continue
 
             step_idx = t - cfg.num_steps_wait
-            if step_idx == 0:
-                initial_image = get_libero_image(obs)
-                initial_bboxes = _extract_bboxes(env, obs, flip=True)
-            if capture_step is not None and step_idx == capture_step:
-                capture_image = get_libero_image(obs)
-                capture_bboxes = _extract_bboxes(env, obs, flip=True)
+            last_frame = {
+                "image": get_libero_image(obs),
+                "bboxes": _extract_bboxes(env, obs, flip=True),
+                "step_idx": step_idx,
+            }
+            for fname, tgt in capture_steps.items():
+                if tgt is not None and step_idx == tgt and fname not in frames:
+                    frames[fname] = dict(last_frame)
 
             observation, _ = prepare_observation(obs, stack.resize_size)
-
             if len(action_queue) == 0:
                 actions = get_action(
                     cfg, stack.model, observation, task_description,
@@ -378,62 +398,83 @@ def _run_rollout(stack: RolloutStack, suite_name, task_id, seed, max_steps, capt
     finally:
         env.close()
 
-    if initial_image is None:
-        raise RuntimeError(f"Rollout for '{suite_name}' task {task_id} produced no post-wait observation.")
+    if last_frame is None:
+        raise RuntimeError(f"Rollout for '{suite_name}' task {task_id} produced no observation.")
+
+    for fname in capture_steps:
+        if fname not in frames:
+            frames[fname] = {**last_frame, "fallback": True}
+
     return {
         "success": success,
-        "initial_image": initial_image,
-        "initial_bboxes": initial_bboxes,
-        "capture_image": capture_image,
-        "capture_bboxes": capture_bboxes,
+        "frames": frames,
+        "final_step_idx": last_frame["step_idx"],
         "task_description": task_description,
         "task_name": task_name,
     }
 
 
-def capture_observation(
+def capture_frames(
     suite_name, task_id, mode="initial", *,
     stack: RolloutStack = None,
     seed=7,
     rollout_max_steps=None,
     rollout_seed_candidates=(7, 13, 21, 42, 100),
-    mid_rollout_step=50,
+    capture_steps=None,
 ):
-    """Return (image, task_description, task_name, bboxes, metadata) for the requested mode."""
+    """Return {task_description, task_name, meta, frames:{frame_name: {image, bboxes, step_idx}}}.
+
+    Modes:
+      initial     : returns a single frame at t=0 without running the policy.
+      success     : runs rollouts until one succeeds; returns all 4 frames.
+      failed      : runs rollouts until one fails; returns all 4 frames.
+      mid_rollout : runs one rollout with `seed`; returns all 4 frames regardless.
+    """
     if mode == "initial":
         image, task_desc, task_name, bboxes = _reset_and_capture_initial(suite_name, task_id, seed)
-        return image, task_desc, task_name, bboxes, {"mode": mode, "seed": seed}
+        return {
+            "task_description": task_desc,
+            "task_name": task_name,
+            "meta": {"mode": mode, "seed": seed},
+            "frames": {"t=0": {"image": np.array(image), "bboxes": bboxes, "step_idx": 0}},
+        }
 
     if stack is None:
         raise ValueError(f"mode='{mode}' requires a RolloutStack (pass stack=...).")
 
+    from experiments.robot.libero.run_libero_eval_bitnet import TASK_MAX_STEPS
+    max_steps = rollout_max_steps or TASK_MAX_STEPS.get(suite_name, 220)
+    steps = _resolve_capture_steps(max_steps, capture_steps)
+
+    def _package(result, meta):
+        packaged = {}
+        for fname, frame in result["frames"].items():
+            packaged[fname] = {
+                "image": np.array(frame["image"]),
+                "bboxes": frame["bboxes"],
+                "step_idx": frame["step_idx"],
+                "fallback": bool(frame.get("fallback", False)),
+            }
+        return {
+            "task_description": result["task_description"],
+            "task_name": result["task_name"],
+            "meta": meta,
+            "frames": packaged,
+        }
+
     if mode == "mid_rollout":
-        result = _run_rollout(stack, suite_name, task_id, seed, rollout_max_steps, mid_rollout_step)
-        if result["capture_image"] is None:
-            raise RuntimeError(
-                f"Rollout ended before mid_rollout_step={mid_rollout_step}. "
-                f"success={result['success']}. Try lowering --mid_rollout_step."
-            )
-        return (
-            result["capture_image"],
-            result["task_description"],
-            result["task_name"],
-            result["capture_bboxes"],
-            {"mode": mode, "seed": seed, "success": result["success"], "step": mid_rollout_step},
-        )
+        result = _run_rollout(stack, suite_name, task_id, seed, max_steps, steps)
+        return _package(result, {"mode": mode, "seed": seed, "success": result["success"],
+                                  "final_step_idx": result["final_step_idx"]})
 
     target_success = (mode == "success")
     for candidate_seed in rollout_seed_candidates:
         print(f"  trying seed={candidate_seed} for mode={mode}...")
-        result = _run_rollout(stack, suite_name, task_id, candidate_seed, rollout_max_steps, capture_step=None)
+        result = _run_rollout(stack, suite_name, task_id, candidate_seed, max_steps, steps)
         if result["success"] == target_success:
-            return (
-                result["initial_image"],
-                result["task_description"],
-                result["task_name"],
-                result["initial_bboxes"],
-                {"mode": mode, "seed": candidate_seed, "success": result["success"]},
-            )
+            return _package(result, {"mode": mode, "seed": candidate_seed,
+                                      "success": result["success"],
+                                      "final_step_idx": result["final_step_idx"]})
     raise RuntimeError(
         f"No rollout seed in {list(rollout_seed_candidates)} produced outcome '{mode}' "
         f"for suite '{suite_name}' task {task_id}."
