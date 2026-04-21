@@ -18,19 +18,25 @@ import os
 import numpy as np
 
 from analysis import common
-from analysis.extract_attention import extract_attention_maps, get_image_token_attention
+from analysis.extract_attention import (
+    extract_attention_maps,
+    extract_siglip_attention_maps,
+    get_image_token_attention,
+    get_siglip_patch_saliency,
+)
 from analysis.visualize_attention import visualize_all_layers
 from bitvla.constants import BITNET_DEFAULT_IMAGE_TOKEN_IDX
 
 
-def analyze_condition(stack, label, suite, mode, task_id, layer_indices, capture_kwargs):
+def analyze_condition(stack, label, suite, mode, task_id, layer_indices, capture_kwargs,
+                      include_siglip=False, siglip_layer_indices=None):
     print(f"\n{'=' * 60}\n[{label}] suite={suite} mode={mode} task={task_id}\n{'=' * 60}")
     image, task_desc, task_name, bboxes, meta = common.capture_observation(
         suite, task_id, mode, stack=stack, **capture_kwargs
     )
     inputs = common.prepare_inputs(stack.model, stack.processor, image, task_desc)
 
-    print("Extracting attention maps...")
+    print("Extracting LLM attention maps...")
     attention_maps = extract_attention_maps(stack.model, inputs, layer_indices=layer_indices)
     image_attention = get_image_token_attention(
         attention_maps,
@@ -38,10 +44,19 @@ def analyze_condition(stack, label, suite, mode, task_id, layer_indices, capture
         image_token_idx=BITNET_DEFAULT_IMAGE_TOKEN_IDX,
     )
 
+    siglip_attention = None
+    if include_siglip:
+        print("Extracting SigLIP attention maps...")
+        siglip_maps = extract_siglip_attention_maps(
+            stack.model, inputs, layer_indices=siglip_layer_indices
+        )
+        siglip_attention = get_siglip_patch_saliency(siglip_maps)
+
     return {
         "label": label,
         "image": np.array(image),
         "attention": image_attention,
+        "siglip_attention": siglip_attention,
         "bboxes": bboxes,
         "task_description": task_desc,
         "task_name": task_name,
@@ -79,37 +94,57 @@ def compute_bbox_attention_ratios(image_attention, bboxes, image_shape, patch_gr
     return results
 
 
-def save_per_condition(result, output_dir, task_id):
+def save_per_condition(result, png_dir, json_dir, task_id):
     visualize_all_layers(
         result["image"],
         result["attention"],
-        task_label=f"{result['task_description']} [{result['label']}]",
-        output_path=os.path.join(output_dir, f"layers_{result['label']}_task{task_id}.png"),
+        task_label=f"{result['task_description']} [{result['label']}] (LLM)",
+        output_path=os.path.join(png_dir, f"layers_{result['label']}_task{task_id}.png"),
         bboxes=result["bboxes"],
     )
 
     ratios = compute_bbox_attention_ratios(
         result["attention"], result["bboxes"], result["image"].shape
     )
-    scores_path = os.path.join(output_dir, f"scores_{result['label']}_task{task_id}.json")
+    payload = {
+        "label": result["label"],
+        "task_description": result["task_description"],
+        "meta": result["meta"],
+        "bboxes": result["bboxes"],
+        "per_layer_ratios_llm": ratios,
+    }
+
+    if result.get("siglip_attention"):
+        visualize_all_layers(
+            result["image"],
+            result["siglip_attention"],
+            task_label=f"{result['task_description']} [{result['label']}] (SigLIP)",
+            output_path=os.path.join(png_dir, f"layers_siglip_{result['label']}_task{task_id}.png"),
+            bboxes=result["bboxes"],
+        )
+        siglip_ratios = compute_bbox_attention_ratios(
+            result["siglip_attention"], result["bboxes"], result["image"].shape
+        )
+        payload["per_layer_ratios_siglip"] = siglip_ratios
+
+    scores_path = os.path.join(json_dir, f"scores_{result['label']}_task{task_id}.json")
     with open(scores_path, "w") as f:
-        json.dump({
-            "label": result["label"],
-            "task_description": result["task_description"],
-            "meta": result["meta"],
-            "bboxes": result["bboxes"],
-            "per_layer_ratios": ratios,
-        }, f, indent=2)
+        json.dump(payload, f, indent=2)
     print(f"Saved: {scores_path}")
 
 
 def main():
     parser = argparse.ArgumentParser(description="BitVLA attention map + score analysis")
     common.add_common_args(parser)
+    parser.add_argument("--include_siglip", action="store_true",
+                        help="Also extract SigLIP patch-to-patch self-attention.")
+    parser.add_argument("--siglip_layers", type=int, nargs="*", default=None,
+                        help="SigLIP layer indices (default: every 5th + last of 26).")
     args = parser.parse_args()
 
     common.set_device(args.device)
-    os.makedirs(args.output_dir, exist_ok=True)
+    png_dir, json_dir = common.resolve_output_dirs(args.output_dir, args.output_subdir)
+    print(f"Output dirs:\n  png:  {png_dir}\n  json: {json_dir}")
 
     conditions = common.parse_conditions(args.condition)
     first_suite = conditions[0][1]
@@ -121,9 +156,18 @@ def main():
 
     if args.layers is None:
         layer_indices, num_layers = common.default_layer_indices(stack.model)
-        print(f"Analyzing layers: {layer_indices} (of {num_layers})")
+        print(f"Analyzing LLM layers: {layer_indices} (of {num_layers})")
     else:
         layer_indices = args.layers
+
+    siglip_layer_indices = args.siglip_layers
+    if args.include_siglip and siglip_layer_indices is None:
+        from transformers.models.siglip.modeling_siglip import SiglipAttention
+        n_siglip = sum(1 for _, m in stack.model.named_modules() if isinstance(m, SiglipAttention))
+        siglip_layer_indices = list(range(0, n_siglip, 5))
+        if (n_siglip - 1) not in siglip_layer_indices:
+            siglip_layer_indices.append(n_siglip - 1)
+        print(f"Analyzing SigLIP layers: {siglip_layer_indices} (of {n_siglip})")
 
     capture_kwargs = dict(
         rollout_max_steps=args.rollout_max_steps,
@@ -133,11 +177,13 @@ def main():
 
     for label, suite, mode in conditions:
         result = analyze_condition(
-            stack, label, suite, mode, args.task_id, layer_indices, capture_kwargs
+            stack, label, suite, mode, args.task_id, layer_indices, capture_kwargs,
+            include_siglip=args.include_siglip,
+            siglip_layer_indices=siglip_layer_indices,
         )
-        save_per_condition(result, args.output_dir, args.task_id)
+        save_per_condition(result, png_dir, json_dir, args.task_id)
 
-    print(f"\nAttention outputs saved to: {args.output_dir}")
+    print(f"\nAttention outputs saved under: {os.path.dirname(png_dir)}")
 
 
 if __name__ == "__main__":

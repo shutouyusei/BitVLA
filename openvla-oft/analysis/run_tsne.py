@@ -53,7 +53,7 @@ def analyze_condition(stack, label, suite, mode, task_id, layer_indices, capture
     }
 
 
-def save_per_condition(result, layer_indices, output_dir, task_id):
+def save_per_condition(result, layer_indices, png_dir, task_id):
     """Grid of t-SNE plots — one per layer — for a single condition."""
     hs = result["hidden_states"]
     layers = [l for l in layer_indices if l in hs]
@@ -79,7 +79,7 @@ def save_per_condition(result, layer_indices, output_dir, task_id):
 
     fig.suptitle(f"{result['task_description']} [{result['label']}]", fontsize=12)
     fig.tight_layout()
-    out = os.path.join(output_dir, f"tsne_{result['label']}_task{task_id}.png")
+    out = os.path.join(png_dir, f"tsne_{result['label']}_task{task_id}.png")
     fig.savefig(out, dpi=120, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved {out}")
@@ -91,7 +91,8 @@ def main():
     args = parser.parse_args()
 
     common.set_device(args.device)
-    os.makedirs(args.output_dir, exist_ok=True)
+    png_dir, _json_dir = common.resolve_output_dirs(args.output_dir, args.output_subdir)
+    print(f"Output dir (png): {png_dir}")
 
     conditions = common.parse_conditions(args.condition)
     first_suite = conditions[0][1]
@@ -117,9 +118,9 @@ def main():
         result = analyze_condition(
             stack, label, suite, mode, args.task_id, layer_indices, capture_kwargs
         )
-        save_per_condition(result, layer_indices, args.output_dir, args.task_id)
+        save_per_condition(result, layer_indices, png_dir, args.task_id)
 
-    print(f"\nt-SNE outputs saved to: {args.output_dir}")
+    print(f"\nt-SNE outputs saved under: {os.path.dirname(png_dir)}")
 
 
 if __name__ == "__main__":

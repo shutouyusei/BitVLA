@@ -134,6 +134,113 @@ def extract_attention_maps(
     return result
 
 
+def extract_siglip_attention_maps(
+    model: torch.nn.Module,
+    inputs: dict,
+    layer_indices: Optional[List[int]] = None,
+) -> Dict[int, torch.Tensor]:
+    """
+    Capture SigLIP self-attention weights (patch-to-patch) from the vision encoder.
+
+    Mirrors extract_attention_maps: pre-hook forces output_attentions=True per layer so
+    SiglipSdpaAttention falls back to the eager path. SiglipFlashAttention2 is unsupported
+    (it hard-codes output_attentions=False); switch to eager or sdpa.
+
+    Returns:
+        dict mapping siglip-layer-idx -> (num_heads, num_patches, num_patches) tensor.
+    """
+    from transformers.models.siglip.modeling_siglip import SiglipAttention
+
+    attn_layers = []
+    for name, module in model.named_modules():
+        if isinstance(module, SiglipAttention):
+            attn_layers.append((name, module))
+
+    if not attn_layers:
+        raise RuntimeError(
+            "No SiglipAttention layers found. Model may not use a SigLIP vision encoder."
+        )
+
+    if layer_indices is None:
+        layer_indices = list(range(len(attn_layers)))
+
+    for idx in layer_indices:
+        if idx >= len(attn_layers):
+            raise ValueError(
+                f"SigLIP layer {idx} out of range (model has {len(attn_layers)} layers)."
+            )
+
+    captured = {}
+    hooks = []
+
+    original_vision_output_attentions = None
+    if hasattr(model.config, "vision_config"):
+        original_vision_output_attentions = getattr(model.config.vision_config, "output_attentions", False)
+        model.config.vision_config.output_attentions = True
+
+    def make_pre_hook():
+        def hook_fn(module, args, kwargs):
+            kwargs["output_attentions"] = True
+            return args, kwargs
+        return hook_fn
+
+    def make_capture_hook(layer_idx):
+        def hook_fn(module, input, output):
+            # SiglipAttention returns (attn_output, attn_weights)
+            if isinstance(output, tuple) and len(output) >= 2 and output[1] is not None:
+                captured[layer_idx] = output[1].detach().cpu()
+        return hook_fn
+
+    for idx in layer_indices:
+        _, module = attn_layers[idx]
+        hooks.append(module.register_forward_pre_hook(make_pre_hook(), with_kwargs=True))
+        hooks.append(module.register_forward_hook(make_capture_hook(idx)))
+
+    try:
+        import copy
+        fwd_inputs = copy.copy(inputs)
+        seq_len = fwd_inputs["input_ids"].shape[1]
+        fwd_inputs["labels"] = torch.full(
+            (1, seq_len), -100, dtype=torch.long, device=fwd_inputs["input_ids"].device
+        )
+        with torch.inference_mode():
+            model(**fwd_inputs)
+    finally:
+        for hook in hooks:
+            hook.remove()
+        if original_vision_output_attentions is not None:
+            model.config.vision_config.output_attentions = original_vision_output_attentions
+
+    if not captured:
+        raise RuntimeError(
+            "No SigLIP attention weights captured. "
+            "Check that the vision encoder uses eager or sdpa attention (not flash_attention_2)."
+        )
+
+    missing = set(layer_indices) - set(captured.keys())
+    if missing:
+        print(f"WARNING: SigLIP layers not captured: {sorted(missing)}")
+
+    return {idx: attn.squeeze(0) for idx, attn in captured.items()}
+
+
+def get_siglip_patch_saliency(
+    siglip_attention_maps: Dict[int, torch.Tensor],
+) -> Dict[int, torch.Tensor]:
+    """
+    Reduce per-layer SigLIP attention (num_heads, num_patches, num_patches) to a per-patch
+    saliency vector (num_patches,) by averaging over heads and query positions.
+
+    The resulting vector answers: "on average, how much do other patches attend to this patch?"
+    Ready to drop into the same bbox scoring and heatmap visualization as the LLM-side map.
+    """
+    result = {}
+    for layer_idx, attn in siglip_attention_maps.items():
+        # attn: (num_heads, num_patches, num_patches). Mean over heads + query axis.
+        result[layer_idx] = attn.float().mean(dim=(0, 1))
+    return result
+
+
 def get_image_token_attention(
     attention_maps: Dict[int, torch.Tensor],
     input_ids: torch.Tensor,

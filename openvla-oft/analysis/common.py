@@ -11,6 +11,7 @@ Exposes:
 
 import argparse
 import copy
+import datetime
 import os
 import sys
 from collections import deque
@@ -154,6 +155,19 @@ def prepare_inputs(model, processor, image, task_label):
     )
 
 
+def resolve_output_dirs(base_dir, subdir=None):
+    """Create and return (png_dir, json_dir) under base_dir/<YYYYMMDD>/{png,json}.
+
+    Pass --output_subdir to override the auto date folder (e.g. a fixed run name).
+    """
+    folder = subdir or datetime.datetime.now().strftime("%Y%m%d")
+    png_dir = os.path.join(base_dir, folder, "png")
+    json_dir = os.path.join(base_dir, folder, "json")
+    os.makedirs(png_dir, exist_ok=True)
+    os.makedirs(json_dir, exist_ok=True)
+    return png_dir, json_dir
+
+
 def default_layer_indices(model):
     """Every 5th BitNetAttention layer plus the last."""
     from transformers.models.llava.modeling_bitnet import BitNetAttention
@@ -199,6 +213,8 @@ def add_common_args(parser):
     )
     parser.add_argument("--task_id", type=int, default=0)
     parser.add_argument("--output_dir", type=str, default="./analysis_output")
+    parser.add_argument("--output_subdir", type=str, default=None,
+                        help="Subdir under --output_dir (default: today's date YYYYMMDD).")
     parser.add_argument("--use_int2_quantization", action="store_true")
     parser.add_argument("--layers", type=int, nargs="*", default=None)
     parser.add_argument("--device", type=str, default="cpu")
