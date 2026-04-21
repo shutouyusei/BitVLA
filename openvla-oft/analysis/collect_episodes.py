@@ -239,6 +239,13 @@ def run_prescreen(args, stack, out_path):
     results = existing if isinstance(existing, dict) else {}
     results.setdefault("suite", args.suite)
     results.setdefault("records", [])
+    # Filter out legacy records that pre-date the init_state_idx switch so resume
+    # still works across a schema change.
+    valid_records = [r for r in results["records"] if "init_state_idx" in r]
+    if len(valid_records) != len(results["records"]):
+        dropped = len(results["records"]) - len(valid_records)
+        print(f"  warn: dropped {dropped} legacy records without init_state_idx")
+        results["records"] = valid_records
     done_pairs = {(r["task_id"], r["init_state_idx"]) for r in results["records"]}
 
     suite = args.suite
