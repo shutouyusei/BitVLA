@@ -1,0 +1,23 @@
+bddl_files_path: "/home/yusei/Desktop/LIS5/LIBERO-PRO/libero/libero/bddl_files/"
+script_path: "/home/yusei/Desktop/LIS5/LIBERO-PRO/notebooks/generate_init_states.py"
+init_file_dir: "/home/yusei/Desktop/LIS5/LIBERO-PRO/libero/libero/init_files/"
+
+use_environment: false
+use_swap: true
+use_object: false
+use_language: false
+use_task: false
+
+ood_task_configs:
+  environment: "/home/yusei/Desktop/LIS5/LIBERO-PRO/libero_ood/ood_environment.yaml"
+  swap: "/home/yusei/Desktop/LIS5/LIBERO-PRO/libero_ood/ood_spatial_relation.yaml"
+  object: "/home/yusei/Desktop/LIS5/LIBERO-PRO/libero_ood/ood_object.yaml"
+  language: "/home/yusei/Desktop/LIS5/LIBERO-PRO/libero_ood/ood_language.yaml"
+  task: "/home/yusei/Desktop/LIS5/LIBERO-PRO/libero_ood/ood_task.yaml"
+
+perturbation_mapping:
+  use_environment: env
+  use_swap: swap
+  use_object: object
+  use_language: lan
+  use_task: task

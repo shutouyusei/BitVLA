@@ -17,9 +17,16 @@ from typing import Optional, Union
 import draccus
 import numpy as np
 import tqdm
+import yaml
 from libero.libero import benchmark
 
 import wandb
+
+sys.path.append(os.path.join(os.path.dirname(__file__), "LIBERO-PRO"))
+try:
+    import perturbation as libero_pro_perturbation
+except ImportError:
+    libero_pro_perturbation = None
 
 # Append current directory so that interpreter can find experiments.robot
 sys.path.append("../..")
@@ -64,15 +71,53 @@ class TaskSuite(str, Enum):
     LIBERO_GOAL = "libero_goal"
     LIBERO_10 = "libero_10"
     LIBERO_90 = "libero_90"
+    # LIBERO-PRO perturbation suites
+    LIBERO_SPATIAL_SWAP = "libero_spatial_swap"
+    LIBERO_OBJECT_SWAP = "libero_object_swap"
+    LIBERO_GOAL_SWAP = "libero_goal_swap"
+    LIBERO_10_SWAP = "libero_10_swap"
+    LIBERO_SPATIAL_LAN = "libero_spatial_lan"
+    LIBERO_OBJECT_LAN = "libero_object_lan"
+    LIBERO_GOAL_LAN = "libero_goal_lan"
+    LIBERO_10_LAN = "libero_10_lan"
+    LIBERO_SPATIAL_OBJECT = "libero_spatial_object"
+    LIBERO_OBJECT_OBJECT = "libero_object_object"
+    LIBERO_GOAL_OBJECT = "libero_goal_object"
+    LIBERO_10_OBJECT = "libero_10_object"
+    LIBERO_SPATIAL_TASK = "libero_spatial_task"
+    LIBERO_OBJECT_TASK = "libero_object_task"
+    LIBERO_GOAL_TASK = "libero_goal_task"
+    LIBERO_10_TASK = "libero_10_task"
+    LIBERO_SPATIAL_ENV = "libero_spatial_env"
+    LIBERO_OBJECT_ENV = "libero_object_env"
+    LIBERO_GOAL_ENV = "libero_goal_env"
+    LIBERO_10_ENV = "libero_10_env"
+    LIBERO_SPATIAL_TEMP = "libero_spatial_temp"
+    LIBERO_OBJECT_TEMP = "libero_object_temp"
+    LIBERO_GOAL_TEMP = "libero_goal_temp"
+    LIBERO_10_TEMP = "libero_10_temp"
 
 
 # Define max steps for each task suite
 TASK_MAX_STEPS = {
-    TaskSuite.LIBERO_SPATIAL: 220,  # longest training demo has 193 steps
-    TaskSuite.LIBERO_OBJECT: 280,  # longest training demo has 254 steps
-    TaskSuite.LIBERO_GOAL: 300,  # longest training demo has 270 steps
-    TaskSuite.LIBERO_10: 520,  # longest training demo has 505 steps
-    TaskSuite.LIBERO_90: 400,  # longest training demo has 373 steps
+    TaskSuite.LIBERO_SPATIAL: 220,
+    TaskSuite.LIBERO_OBJECT: 280,
+    TaskSuite.LIBERO_GOAL: 300,
+    TaskSuite.LIBERO_10: 520,
+    TaskSuite.LIBERO_90: 400,
+    # LIBERO-PRO suites use the same max steps as their base suite
+    TaskSuite.LIBERO_SPATIAL_SWAP: 220, TaskSuite.LIBERO_SPATIAL_LAN: 220,
+    TaskSuite.LIBERO_SPATIAL_OBJECT: 220, TaskSuite.LIBERO_SPATIAL_TASK: 220,
+    TaskSuite.LIBERO_SPATIAL_ENV: 220, TaskSuite.LIBERO_SPATIAL_TEMP: 220,
+    TaskSuite.LIBERO_OBJECT_SWAP: 280, TaskSuite.LIBERO_OBJECT_LAN: 280,
+    TaskSuite.LIBERO_OBJECT_OBJECT: 280, TaskSuite.LIBERO_OBJECT_TASK: 280,
+    TaskSuite.LIBERO_OBJECT_ENV: 280, TaskSuite.LIBERO_OBJECT_TEMP: 280,
+    TaskSuite.LIBERO_GOAL_SWAP: 300, TaskSuite.LIBERO_GOAL_LAN: 300,
+    TaskSuite.LIBERO_GOAL_OBJECT: 300, TaskSuite.LIBERO_GOAL_TASK: 300,
+    TaskSuite.LIBERO_GOAL_ENV: 300, TaskSuite.LIBERO_GOAL_TEMP: 300,
+    TaskSuite.LIBERO_10_SWAP: 520, TaskSuite.LIBERO_10_LAN: 520,
+    TaskSuite.LIBERO_10_OBJECT: 520, TaskSuite.LIBERO_10_TASK: 520,
+    TaskSuite.LIBERO_10_ENV: 520, TaskSuite.LIBERO_10_TEMP: 520,
 }
 
 
@@ -110,6 +155,7 @@ class GenerateConfig:
     load_in_8bit: bool = False                       # (For OpenVLA only) Load with 8-bit quantization
     load_in_4bit: bool = False                       # (For OpenVLA only) Load with 4-bit quantization
     use_int2_quantization: bool = False              # Quantize BitLinear layers to 2-bit at load time (reduces VRAM, no accuracy loss for ternary weights)
+    evaluation_config_path: str = ""                 # Path to LIBERO-PRO evaluation_config.yaml (enables perturbation evaluation)
 
     #################################################################################################################
     # LIBERO environment-specific parameters
@@ -189,8 +235,16 @@ def initialize_model(cfg: GenerateConfig):
 
 def check_unnorm_key(cfg: GenerateConfig, model) -> None:
     """Check that the model contains the action un-normalization key."""
-    # Initialize unnorm_key
-    unnorm_key = cfg.task_suite_name
+    # Use unnorm_key if explicitly set, otherwise derive from task_suite_name
+    # Strip LIBERO-PRO suffixes (_swap, _lan, _object, _task, _env, _temp) to get base key
+    if cfg.unnorm_key:
+        unnorm_key = cfg.unnorm_key
+    else:
+        unnorm_key = cfg.task_suite_name
+        for suffix in ["_swap", "_lan", "_object", "_task", "_env", "_temp"]:
+            if unnorm_key.endswith(suffix):
+                unnorm_key = unnorm_key[: -len(suffix)]
+                break
 
     # In some cases, the key must be manually modified (e.g. after training on a modified version of the dataset
     # with the suffix "_no_noops" in the dataset name)
@@ -474,8 +528,64 @@ def eval_libero(cfg: GenerateConfig) -> float:
     # Validate configuration
     validate_config(cfg)
 
+    # Apply LIBERO-PRO perturbations if config is provided
+    if cfg.evaluation_config_path and os.path.exists(cfg.evaluation_config_path):
+        assert libero_pro_perturbation is not None, "LIBERO-PRO not found. Symlink it to experiments/robot/libero/LIBERO-PRO/"
+        with open(cfg.evaluation_config_path, "r", encoding="utf-8") as f:
+            evaluation_cfg = yaml.safe_load(f)
+
+        evaluation_cfg["bddl_files_path"] = evaluation_cfg.get("bddl_files_path", "") + "/" + cfg.task_suite_name
+        evaluation_cfg["task_suite_name"] = cfg.task_suite_name
+
+        use_swap = evaluation_cfg.get("use_swap", False)
+        use_object = evaluation_cfg.get("use_object", False)
+        use_language = evaluation_cfg.get("use_language", False)
+        use_task = evaluation_cfg.get("use_task", False)
+        use_environment = evaluation_cfg.get("use_environment", False)
+
+        if sum([use_swap, use_object, use_language, use_task, use_environment]) > 1:
+            bddl_file_path = evaluation_cfg.get("bddl_files_path", "") + cfg.task_suite_name + "_temp/"
+            init_file_path = evaluation_cfg.get("init_file_dir", "") + cfg.task_suite_name + "_temp/"
+            if not os.path.exists(bddl_file_path) or not os.path.exists(init_file_path):
+                os.makedirs(init_file_path, exist_ok=True)
+                os.makedirs(bddl_file_path, exist_ok=True)
+                log_content = f"{use_swap},{use_object},{use_language},{use_task},{use_environment}"
+                with open(os.path.join(bddl_file_path, "log.txt"), "w") as log_file:
+                    log_file.write(log_content)
+                libero_pro_perturbation.create_env(configs=evaluation_cfg)
+            else:
+                with open(os.path.join(bddl_file_path, "log.txt"), "r") as log_file:
+                    log_contents = log_file.read().strip()
+                expected_log = f"{use_swap},{use_object},{use_language},{use_task},{use_environment}"
+                if log_contents != expected_log:
+                    for folder in [bddl_file_path, init_file_path]:
+                        for root, dirs, files in os.walk(folder, topdown=False):
+                            for name in files:
+                                os.remove(os.path.join(root, name))
+                            for name in dirs:
+                                os.rmdir(os.path.join(root, name))
+                    os.makedirs(init_file_path, exist_ok=True)
+                    os.makedirs(bddl_file_path, exist_ok=True)
+                    with open(os.path.join(bddl_file_path, "log.txt"), "w") as log_file:
+                        log_file.write(expected_log)
+                    libero_pro_perturbation.create_env(configs=evaluation_cfg)
+            cfg.task_suite_name = cfg.task_suite_name + "_temp"
+        else:
+            perturb_key = None
+            for key in ["use_swap", "use_object", "use_language", "use_task", "use_environment"]:
+                if evaluation_cfg.get(key, False):
+                    perturb_key = key
+                    break
+            if perturb_key:
+                suffix = evaluation_cfg.get("perturbation_mapping", {}).get(perturb_key, "")
+                init_file_path = evaluation_cfg.get("init_file_dir", "") + cfg.task_suite_name + "_" + suffix
+                if not os.path.exists(init_file_path):
+                    libero_pro_perturbation.create_env(configs=evaluation_cfg)
+                cfg.task_suite_name = cfg.task_suite_name + "_" + suffix
+        print(f"LIBERO-PRO: Evaluating with perturbed task suite: {cfg.task_suite_name}")
+
     cfg.local_log_dir = os.path.join(cfg.local_log_dir,cfg.info_in_path)
-    
+
     # Set random seed
     set_seed_everywhere(cfg.seed)
 
