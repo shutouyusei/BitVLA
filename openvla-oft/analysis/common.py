@@ -169,14 +169,19 @@ def resolve_output_dirs(base_dir, subdir=None):
 
 
 def default_layer_indices(model):
-    """Every 5th BitNetAttention layer plus the last."""
+    """All BitNetAttention layers (Phase 1 design requires full layer coverage)."""
     from transformers.models.llava.modeling_bitnet import BitNetAttention
 
     num_layers = sum(1 for _, m in model.named_modules() if isinstance(m, BitNetAttention))
-    layers = list(range(0, num_layers, 5))
-    if (num_layers - 1) not in layers:
-        layers.append(num_layers - 1)
-    return layers, num_layers
+    return list(range(num_layers)), num_layers
+
+
+def default_siglip_layer_indices(model):
+    """All SiglipAttention layers."""
+    from transformers.models.siglip.modeling_siglip import SiglipAttention
+
+    num_layers = sum(1 for _, m in model.named_modules() if isinstance(m, SiglipAttention))
+    return list(range(num_layers)), num_layers
 
 
 VALID_CAPTURE_MODES = {"initial", "success", "failed", "mid_rollout"}
@@ -252,8 +257,20 @@ def _make_seg_env(task, resolution=256):
     return env
 
 
+_ROBOT_NAME_KEYWORDS = ("panda", "gripper", "mount", "rethink")
+
+
+def _is_robot_name(name: str) -> bool:
+    lower = name.lower()
+    return any(kw in lower for kw in _ROBOT_NAME_KEYWORDS)
+
+
 def _extract_bboxes(env, obs, flip=True):
-    """Return [{name, bbox: (ymin, xmin, ymax, xmax), is_target: bool}] for all scene objects."""
+    """Return [{name, bbox, is_target, is_robot}] for all scene objects.
+
+    is_robot flags Panda/Gripper/Mount/Rethink entries so downstream metrics
+    can exclude the robot (per Phase 1 design: '計測対象物体: 全物体（ロボット除く）').
+    """
     seg = obs.get("agentview_segmentation_instance")
     if seg is None:
         return []
@@ -274,6 +291,7 @@ def _extract_bboxes(env, obs, flip=True):
             "name": name,
             "bbox": (int(ymin), int(xmin), int(ymax), int(xmax)),
             "is_target": name in target_names,
+            "is_robot": _is_robot_name(name),
         })
     return bboxes
 

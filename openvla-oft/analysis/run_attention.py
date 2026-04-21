@@ -22,7 +22,9 @@ from analysis.extract_attention import (
     extract_attention_maps,
     extract_siglip_attention_maps,
     get_image_token_attention,
+    get_image_token_attention_per_head,
     get_siglip_patch_saliency,
+    get_siglip_patch_saliency_per_head,
 )
 from analysis.visualize_attention import visualize_all_layers
 from bitvla.constants import BITNET_DEFAULT_IMAGE_TOKEN_IDX
@@ -43,20 +45,29 @@ def analyze_condition(stack, label, suite, mode, task_id, layer_indices, capture
         inputs["input_ids"],
         image_token_idx=BITNET_DEFAULT_IMAGE_TOKEN_IDX,
     )
+    image_attention_per_head = get_image_token_attention_per_head(
+        attention_maps,
+        inputs["input_ids"],
+        image_token_idx=BITNET_DEFAULT_IMAGE_TOKEN_IDX,
+    )
 
     siglip_attention = None
+    siglip_attention_per_head = None
     if include_siglip:
         print("Extracting SigLIP attention maps...")
         siglip_maps = extract_siglip_attention_maps(
             stack.model, inputs, layer_indices=siglip_layer_indices
         )
         siglip_attention = get_siglip_patch_saliency(siglip_maps)
+        siglip_attention_per_head = get_siglip_patch_saliency_per_head(siglip_maps)
 
     return {
         "label": label,
         "image": np.array(image),
         "attention": image_attention,
+        "attention_per_head": image_attention_per_head,
         "siglip_attention": siglip_attention,
+        "siglip_attention_per_head": siglip_attention_per_head,
         "bboxes": bboxes,
         "task_description": task_desc,
         "task_name": task_name,
@@ -64,32 +75,90 @@ def analyze_condition(stack, label, suite, mode, task_id, layer_indices, capture
     }
 
 
-def compute_bbox_attention_ratios(image_attention, bboxes, image_shape, patch_grid_size=16):
-    """For each layer + object bbox, fraction of attention mass inside the bbox.
+def _bbox_to_grid(bbox, H, W, grid):
+    ymin, xmin, ymax, xmax = bbox
+    gy0 = max(int(np.floor(ymin * grid / H)), 0)
+    gy1 = min(int(np.ceil(ymax * grid / H)), grid)
+    gx0 = max(int(np.floor(xmin * grid / W)), 0)
+    gx1 = min(int(np.ceil(xmax * grid / W)), grid)
+    return gy0, gy1, gx0, gx1
 
-    Attention map has patch_grid_size**2 patches covering the image uniformly; we sum the
-    patch values whose image-space rectangle overlaps the bbox, divided by the total sum.
+
+def compute_bbox_attention_ratios(image_attention, bboxes, image_shape, patch_grid_size=16):
+    """Head-averaged per-layer, per-object attention mass ratio.
+
+    Ratio denominator is attention summed over non-robot patches (so the
+    robot never inflates the normalizer). Robot bboxes are still recorded
+    with their raw mass for reference but flagged so downstream stats skip them.
     """
     H, W = image_shape[:2]
-    scale_y = patch_grid_size / H
-    scale_x = patch_grid_size / W
     results = {}
     for layer_idx, attn in image_attention.items():
         attn_grid = attn.float().cpu().numpy().reshape(patch_grid_size, patch_grid_size)
-        total = float(attn_grid.sum())
+        # Exclude robot region from the denominator
+        robot_mask = np.zeros_like(attn_grid, dtype=bool)
+        for b in bboxes:
+            if b.get("is_robot"):
+                gy0, gy1, gx0, gx1 = _bbox_to_grid(b["bbox"], H, W, patch_grid_size)
+                robot_mask[gy0:gy1, gx0:gx1] = True
+        non_robot_total = float(attn_grid[~robot_mask].sum())
         per_object = {}
         for b in bboxes:
-            ymin, xmin, ymax, xmax = b["bbox"]
-            gy0 = max(int(np.floor(ymin * scale_y)), 0)
-            gy1 = min(int(np.ceil(ymax * scale_y)), patch_grid_size)
-            gx0 = max(int(np.floor(xmin * scale_x)), 0)
-            gx1 = min(int(np.ceil(xmax * scale_x)), patch_grid_size)
+            gy0, gy1, gx0, gx1 = _bbox_to_grid(b["bbox"], H, W, patch_grid_size)
             if gy1 <= gy0 or gx1 <= gx0:
                 ratio = 0.0
+            elif b.get("is_robot"):
+                ratio = float("nan")  # robot is excluded from target metric
             else:
                 inside = float(attn_grid[gy0:gy1, gx0:gx1].sum())
-                ratio = inside / total if total > 0 else 0.0
-            per_object[b["name"]] = {"ratio": ratio, "is_target": bool(b.get("is_target"))}
+                ratio = inside / non_robot_total if non_robot_total > 0 else 0.0
+            per_object[b["name"]] = {
+                "ratio": ratio,
+                "is_target": bool(b.get("is_target")),
+                "is_robot": bool(b.get("is_robot")),
+            }
+        results[int(layer_idx)] = per_object
+    return results
+
+
+def compute_bbox_attention_ratios_per_head(image_attention_per_head, bboxes, image_shape, patch_grid_size=16):
+    """Per-head stats: for each layer + (non-robot) object, record max/std across heads.
+
+    Auxiliary metric per Phase 1 design — surfaces whether a single head
+    already localizes the target even when head-averaged attention is diffuse.
+    """
+    H, W = image_shape[:2]
+    results = {}
+    for layer_idx, attn_heads in image_attention_per_head.items():
+        attn_np = attn_heads.float().cpu().numpy()  # (num_heads, num_patches)
+        num_heads = attn_np.shape[0]
+        # Build per-head robot-excluded denominators
+        grid = patch_grid_size
+        robot_mask = np.zeros((grid, grid), dtype=bool)
+        for b in bboxes:
+            if b.get("is_robot"):
+                gy0, gy1, gx0, gx1 = _bbox_to_grid(b["bbox"], H, W, grid)
+                robot_mask[gy0:gy1, gx0:gx1] = True
+        per_object = {}
+        for b in bboxes:
+            if b.get("is_robot"):
+                continue
+            gy0, gy1, gx0, gx1 = _bbox_to_grid(b["bbox"], H, W, grid)
+            if gy1 <= gy0 or gx1 <= gx0:
+                per_object[b["name"]] = {"max": 0.0, "std": 0.0, "is_target": bool(b.get("is_target"))}
+                continue
+            ratios = []
+            for h in range(num_heads):
+                head_grid = attn_np[h].reshape(grid, grid)
+                denom = float(head_grid[~robot_mask].sum())
+                inside = float(head_grid[gy0:gy1, gx0:gx1].sum())
+                ratios.append(inside / denom if denom > 0 else 0.0)
+            ratios = np.asarray(ratios)
+            per_object[b["name"]] = {
+                "max": float(ratios.max()),
+                "std": float(ratios.std()),
+                "is_target": bool(b.get("is_target")),
+            }
         results[int(layer_idx)] = per_object
     return results
 
@@ -106,12 +175,16 @@ def save_per_condition(result, png_dir, json_dir, task_id):
     ratios = compute_bbox_attention_ratios(
         result["attention"], result["bboxes"], result["image"].shape
     )
+    per_head_stats = compute_bbox_attention_ratios_per_head(
+        result["attention_per_head"], result["bboxes"], result["image"].shape
+    )
     payload = {
         "label": result["label"],
         "task_description": result["task_description"],
         "meta": result["meta"],
         "bboxes": result["bboxes"],
         "per_layer_ratios_llm": ratios,
+        "per_layer_per_head_llm": per_head_stats,
     }
 
     if result.get("siglip_attention"):
@@ -125,7 +198,11 @@ def save_per_condition(result, png_dir, json_dir, task_id):
         siglip_ratios = compute_bbox_attention_ratios(
             result["siglip_attention"], result["bboxes"], result["image"].shape
         )
+        siglip_per_head = compute_bbox_attention_ratios_per_head(
+            result["siglip_attention_per_head"], result["bboxes"], result["image"].shape
+        )
         payload["per_layer_ratios_siglip"] = siglip_ratios
+        payload["per_layer_per_head_siglip"] = siglip_per_head
 
     scores_path = os.path.join(json_dir, f"scores_{result['label']}_task{task_id}.json")
     with open(scores_path, "w") as f:
@@ -162,12 +239,8 @@ def main():
 
     siglip_layer_indices = args.siglip_layers
     if args.include_siglip and siglip_layer_indices is None:
-        from transformers.models.siglip.modeling_siglip import SiglipAttention
-        n_siglip = sum(1 for _, m in stack.model.named_modules() if isinstance(m, SiglipAttention))
-        siglip_layer_indices = list(range(0, n_siglip, 5))
-        if (n_siglip - 1) not in siglip_layer_indices:
-            siglip_layer_indices.append(n_siglip - 1)
-        print(f"Analyzing SigLIP layers: {siglip_layer_indices} (of {n_siglip})")
+        siglip_layer_indices, n_siglip = common.default_siglip_layer_indices(stack.model)
+        print(f"Analyzing SigLIP layers: 0..{n_siglip - 1} (all {n_siglip})")
 
     capture_kwargs = dict(
         rollout_max_steps=args.rollout_max_steps,

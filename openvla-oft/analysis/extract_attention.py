@@ -227,17 +227,43 @@ def extract_siglip_attention_maps(
 def get_siglip_patch_saliency(
     siglip_attention_maps: Dict[int, torch.Tensor],
 ) -> Dict[int, torch.Tensor]:
-    """
-    Reduce per-layer SigLIP attention (num_heads, num_patches, num_patches) to a per-patch
-    saliency vector (num_patches,) by averaging over heads and query positions.
+    """Reduce SigLIP attention (heads, patches, patches) → (patches,) by mean over heads + queries."""
+    return {idx: attn.float().mean(dim=(0, 1)) for idx, attn in siglip_attention_maps.items()}
 
-    The resulting vector answers: "on average, how much do other patches attend to this patch?"
-    Ready to drop into the same bbox scoring and heatmap visualization as the LLM-side map.
-    """
+
+def get_siglip_patch_saliency_per_head(
+    siglip_attention_maps: Dict[int, torch.Tensor],
+) -> Dict[int, torch.Tensor]:
+    """Per-head saliency (heads, patches) — mean over query positions only."""
+    return {idx: attn.float().mean(dim=1) for idx, attn in siglip_attention_maps.items()}
+
+
+def get_image_token_attention_per_head(
+    attention_maps: Dict[int, torch.Tensor],
+    input_ids: torch.Tensor,
+    image_token_idx: int,
+    num_patches_per_image: int = 256,
+) -> Dict[int, torch.Tensor]:
+    """Per-head variant of get_image_token_attention. Returns (num_heads, num_patches) per layer."""
+    if input_ids.dim() == 2:
+        input_ids = input_ids.squeeze(0)
+
+    image_mask = input_ids == image_token_idx
+    image_positions = torch.where(image_mask)[0]
+    if len(image_positions) == 0:
+        raise ValueError(f"No image tokens found with idx={image_token_idx}")
+
+    first_image_start = image_positions[0].item()
+    first_image_end = first_image_start + num_patches_per_image
+
     result = {}
-    for layer_idx, attn in siglip_attention_maps.items():
-        # attn: (num_heads, num_patches, num_patches). Mean over heads + query axis.
-        result[layer_idx] = attn.float().mean(dim=(0, 1))
+    for layer_idx, attn in attention_maps.items():
+        # attn: (num_heads, seq_len, seq_len). Do NOT average heads.
+        image_attn = attn.float()[:, :, first_image_start:first_image_end]  # (heads, seq, patches)
+        non_image_mask = (~image_mask).to(image_attn.device)
+        # Average across non-image query positions only
+        non_image_attn = image_attn[:, non_image_mask, :]  # (heads, n_non_img, patches)
+        result[layer_idx] = non_image_attn.mean(dim=1)  # (heads, patches)
     return result
 
 
