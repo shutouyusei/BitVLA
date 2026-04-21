@@ -30,6 +30,8 @@ from experiments.robot.openvla_utils import (
 DEVICE = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
 BITNET_VLA_IMAGE_SIZE = 224
 from bitvla.dataset.bitvla_transform import llava_to_openai
+import os as _os
+sys.path.insert(0, _os.path.join(_os.path.dirname(__file__), "..", ".."))
 from int2_quantizer import quantize_bitlinear_layers
 
 

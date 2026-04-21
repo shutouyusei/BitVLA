@@ -1,18 +1,21 @@
-torchrun --standalone --nnodes 1 --nproc-per-node 4 ../vla-scripts/finetune_bitnet.py \
-  --vla_path /path/to/BitVLA-pretrain-200k \
-  --data_root_dir /path/to/modified_libero_rlds/ \
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+torchrun --standalone --nnodes 1 --nproc-per-node 1 "$SCRIPT_DIR/../vla-scripts/finetune_bitnet.py" \
+  --vla_path /home/yusei/Desktop/LIS5/BitVLA/bitvla-bf16 \
+  --data_root_dir /home/yusei/Desktop/LIS5/BitVLA/modified_libero_rlds/ \
   --dataset_name libero_spatial_no_noops \
-  --run_root_dir /path/to/save/your/ckpt \
+  --run_root_dir /home/yusei/Desktop/LIS5/BitVLA/checkpoints \
   --use_l1_regression True \
   --warmup_steps 375 \
   --use_lora False \
   --num_images_in_input 2 \
   --use_proprio True \
-  --batch_size 2 \
-  --grad_accumulation_steps 8 \
+  --batch_size 1 \
+  --grad_accumulation_steps 16 \
   --learning_rate 1e-4 \
   --max_steps 10001 \
   --save_freq 10000 \
   --save_latest_checkpoint_only False \
   --image_aug True \
-  --run_id_note your_id
+  --wandb_entity kichharu2468yaai-kyushu-university \
+  --wandb_project bitvla \
+  --run_id_note bitvla_spatial_1gpu
