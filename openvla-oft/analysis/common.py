@@ -67,8 +67,23 @@ def load_rollout_stack(checkpoint_path, use_int2=False, task_suite_name="libero_
     from experiments.robot.libero.run_libero_eval_bitnet import initialize_model
     from experiments.robot.robot_utils import get_image_resize_size
 
+    from bitvla.constants import (
+        BITNET_DEFAULT_IMAGE_TOKEN_IDX,
+        BITNET_PROPRIO_PAD_IDX,
+        BITNET_IGNORE_INDEX,
+        BITNET_ACTION_TOKEN_BEGIN_IDX,
+        BITNET_STOP_INDEX,
+    )
+
     cfg = _build_cfg(checkpoint_path, use_int2, task_suite_name)
     model, action_head, proprio_projector, noisy_action_projector, processor = initialize_model(cfg)
+    model.set_constant(
+        image_token_idx=BITNET_DEFAULT_IMAGE_TOKEN_IDX,
+        proprio_pad_idx=BITNET_PROPRIO_PAD_IDX,
+        ignore_idx=BITNET_IGNORE_INDEX,
+        action_token_begin_idx=BITNET_ACTION_TOKEN_BEGIN_IDX,
+        stop_index=BITNET_STOP_INDEX,
+    )
     model = model.to(DEVICE)
     model.eval()
     if action_head is not None:
@@ -178,8 +193,8 @@ def parse_conditions(arg_list):
 def add_common_args(parser):
     parser.add_argument("--checkpoint_path", type=str, required=True)
     parser.add_argument(
-        "--condition", type=str, nargs="+", required=True,
-        help="One or more 'label:suite[:mode]' entries. "
+        "--condition", type=str, action="append", required=True,
+        help="Repeatable flag. Each entry: 'label:suite[:mode]'. "
              "mode ∈ {initial, success, failed, mid_rollout} (default: initial).",
     )
     parser.add_argument("--task_id", type=int, default=0)
@@ -200,7 +215,7 @@ def _get_task_and_init(suite_name, task_id):
     task_suite = benchmark_dict[suite_name]()
     task = task_suite.get_task(task_id)
     initial_states = task_suite.get_task_init_states(task_id)
-    if not initial_states:
+    if initial_states is None or len(initial_states) == 0:
         raise RuntimeError(f"No initial states for task {task_id} in suite '{suite_name}'.")
     return task, initial_states[0], task.language, task.name
 

@@ -182,7 +182,7 @@ def get_image_token_attention(
         image_attn = attn_mean[:, first_image_start:first_image_end]  # (seq_len, num_patches)
 
         # Average across all non-image query positions to get overall image attention
-        non_image_mask = ~image_mask
+        non_image_mask = (~image_mask).to(image_attn.device)
         non_image_attn = image_attn[non_image_mask]  # (num_non_image_tokens, num_patches)
         avg_attn = non_image_attn.mean(dim=0)  # (num_patches,)
 
