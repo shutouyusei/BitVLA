@@ -235,13 +235,17 @@ def initialize_model(cfg: GenerateConfig):
 
 def check_unnorm_key(cfg: GenerateConfig, model) -> None:
     """Check that the model contains the action un-normalization key."""
-    # Use unnorm_key if explicitly set, otherwise derive from task_suite_name
-    # Strip LIBERO-PRO suffixes (_swap, _lan, _object, _task, _env, _temp) to get base key
+    # Use unnorm_key if explicitly set, otherwise derive from task_suite_name.
+    # LIBERO-PRO perturbation suites append a suffix (_swap/_lan/_object/_task/_env/_temp),
+    # and the OOD split additionally appends _ood. Strip both in sequence so the base
+    # training key (e.g. libero_spatial) surfaces.
     if cfg.unnorm_key:
         unnorm_key = cfg.unnorm_key
     else:
         unnorm_key = cfg.task_suite_name
-        for suffix in ["_swap", "_lan", "_object", "_task", "_env", "_temp"]:
+        if unnorm_key.endswith("_ood"):
+            unnorm_key = unnorm_key[: -len("_ood")]
+        for suffix in ["_swap", "_lan", "_object", "_task", "_env", "_temp", "_relation", "_semantic"]:
             if unnorm_key.endswith(suffix):
                 unnorm_key = unnorm_key[: -len(suffix)]
                 break
