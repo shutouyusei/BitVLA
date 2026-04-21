@@ -22,6 +22,27 @@ from PIL import Image
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 
+def _draw_bboxes(ax, bboxes):
+    """Overlay per-object bounding boxes. Target objects are drawn in red, others in lime."""
+    if not bboxes:
+        return
+    from matplotlib.patches import Rectangle
+
+    for b in bboxes:
+        ymin, xmin, ymax, xmax = b["bbox"]
+        color = "red" if b.get("is_target") else "lime"
+        rect = Rectangle(
+            (xmin, ymin), xmax - xmin, ymax - ymin,
+            linewidth=1.2, edgecolor=color, facecolor="none",
+        )
+        ax.add_patch(rect)
+        ax.text(
+            xmin, max(ymin - 2, 0), b["name"],
+            color=color, fontsize=6,
+            bbox=dict(boxstyle="round,pad=0.1", fc="black", ec="none", alpha=0.5),
+        )
+
+
 def visualize_attention_on_image(
     image: np.ndarray,
     attention_over_patches: torch.Tensor,
@@ -30,6 +51,7 @@ def visualize_attention_on_image(
     title: str = "",
     alpha: float = 0.5,
     cmap: str = "jet",
+    bboxes=None,
 ) -> plt.Axes:
     """
     Overlay attention heatmap on the input image.
@@ -65,6 +87,7 @@ def visualize_attention_on_image(
 
     ax.imshow(image)
     ax.imshow(attn_upscaled, alpha=alpha, cmap=cmap)
+    _draw_bboxes(ax, bboxes)
     ax.set_title(title, fontsize=12)
     ax.axis("off")
 
@@ -126,6 +149,7 @@ def visualize_all_layers(
     output_path: str = "attention_all_layers.png",
     patch_grid_size: int = 16,
     max_layers: int = 12,
+    bboxes=None,
 ) -> None:
     """
     Grid visualization of attention maps across multiple layers.
@@ -157,6 +181,7 @@ def visualize_all_layers(
             patch_grid_size=patch_grid_size,
             ax=axes[i],
             title=f"Layer {layer_idx}",
+            bboxes=bboxes,
         )
 
     # Hide unused axes

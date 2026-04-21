@@ -220,25 +220,67 @@ def _get_task_and_init(suite_name, task_id):
     return task, initial_states[0], task.language, task.name
 
 
+def _make_seg_env(task, resolution=256):
+    """Construct a LIBERO env with instance segmentation enabled."""
+    from libero.libero import get_libero_path
+    from libero.libero.envs import SegmentationRenderEnv
+
+    bddl = os.path.join(get_libero_path("bddl_files"), task.problem_folder, task.bddl_file)
+    env = SegmentationRenderEnv(
+        bddl_file_name=bddl,
+        camera_heights=resolution,
+        camera_widths=resolution,
+        camera_segmentations="instance",
+    )
+    env.seed(0)
+    return env
+
+
+def _extract_bboxes(env, obs, flip=True):
+    """Return [{name, bbox: (ymin, xmin, ymax, xmax), is_target: bool}] for all scene objects."""
+    seg = obs.get("agentview_segmentation_instance")
+    if seg is None:
+        return []
+    seg = np.squeeze(np.asarray(seg))
+    if flip:
+        seg = seg[::-1, ::-1]
+    target_names = set(getattr(env, "obj_of_interest", None) or [])
+    bboxes = []
+    for inst_id, name in env.segmentation_id_mapping.items():
+        mask = (seg == inst_id + 1)
+        if not mask.any():
+            continue
+        rows = np.any(mask, axis=1)
+        cols = np.any(mask, axis=0)
+        ymin, ymax = np.where(rows)[0][[0, -1]]
+        xmin, xmax = np.where(cols)[0][[0, -1]]
+        bboxes.append({
+            "name": name,
+            "bbox": (int(ymin), int(xmin), int(ymax), int(xmax)),
+            "is_target": name in target_names,
+        })
+    return bboxes
+
+
 def _reset_and_capture_initial(suite_name, task_id, seed):
-    from experiments.robot.libero.libero_utils import get_libero_env, get_libero_image
+    from experiments.robot.libero.libero_utils import get_libero_image
     task, init_state, task_description, task_name = _get_task_and_init(suite_name, task_id)
-    env, _ = get_libero_env(task, model_family="bitnet", resolution=256)
+    env = _make_seg_env(task, resolution=256)
     try:
         env.seed(seed)
         env.reset()
         env.set_init_state(init_state)
         obs = env.step(np.zeros(7))[0]
         image = get_libero_image(obs)
+        bboxes = _extract_bboxes(env, obs, flip=True)
     finally:
         env.close()
-    return image, task_description, task_name
+    return image, task_description, task_name, bboxes
 
 
 def _run_rollout(stack: RolloutStack, suite_name, task_id, seed, max_steps, capture_step):
-    """Run a single rollout. Returns dict with success, initial_image, capture_image, task_description."""
+    """Run a single rollout. Returns success flag + image/bbox pairs at the initial and capture frames."""
     from experiments.robot.libero.libero_utils import (
-        get_libero_env,
         get_libero_image,
         get_libero_dummy_action,
     )
@@ -251,13 +293,15 @@ def _run_rollout(stack: RolloutStack, suite_name, task_id, seed, max_steps, capt
 
     task, init_state, task_description, task_name = _get_task_and_init(suite_name, task_id)
     cfg = stack.cfg
-    cfg.task_suite_name = suite_name  # propagate for TASK_MAX_STEPS lookup
+    cfg.task_suite_name = suite_name
     if max_steps is None:
         max_steps = TASK_MAX_STEPS.get(suite_name, 220)
 
-    env, _ = get_libero_env(task, model_family="bitnet", resolution=256)
+    env = _make_seg_env(task, resolution=256)
     initial_image = None
+    initial_bboxes = []
     capture_image = None
+    capture_bboxes = []
     action_queue = deque(maxlen=cfg.num_open_loop_steps)
     success = False
     try:
@@ -274,8 +318,10 @@ def _run_rollout(stack: RolloutStack, suite_name, task_id, seed, max_steps, capt
             step_idx = t - cfg.num_steps_wait
             if step_idx == 0:
                 initial_image = get_libero_image(obs)
+                initial_bboxes = _extract_bboxes(env, obs, flip=True)
             if capture_step is not None and step_idx == capture_step:
                 capture_image = get_libero_image(obs)
+                capture_bboxes = _extract_bboxes(env, obs, flip=True)
 
             observation, _ = prepare_observation(obs, stack.resize_size)
 
@@ -303,7 +349,9 @@ def _run_rollout(stack: RolloutStack, suite_name, task_id, seed, max_steps, capt
     return {
         "success": success,
         "initial_image": initial_image,
+        "initial_bboxes": initial_bboxes,
         "capture_image": capture_image,
+        "capture_bboxes": capture_bboxes,
         "task_description": task_description,
         "task_name": task_name,
     }
@@ -317,10 +365,10 @@ def capture_observation(
     rollout_seed_candidates=(7, 13, 21, 42, 100),
     mid_rollout_step=50,
 ):
-    """Return (image, task_description, task_name, metadata) for the requested mode."""
+    """Return (image, task_description, task_name, bboxes, metadata) for the requested mode."""
     if mode == "initial":
-        image, task_desc, task_name = _reset_and_capture_initial(suite_name, task_id, seed)
-        return image, task_desc, task_name, {"mode": mode, "seed": seed}
+        image, task_desc, task_name, bboxes = _reset_and_capture_initial(suite_name, task_id, seed)
+        return image, task_desc, task_name, bboxes, {"mode": mode, "seed": seed}
 
     if stack is None:
         raise ValueError(f"mode='{mode}' requires a RolloutStack (pass stack=...).")
@@ -336,6 +384,7 @@ def capture_observation(
             result["capture_image"],
             result["task_description"],
             result["task_name"],
+            result["capture_bboxes"],
             {"mode": mode, "seed": seed, "success": result["success"], "step": mid_rollout_step},
         )
 
@@ -348,6 +397,7 @@ def capture_observation(
                 result["initial_image"],
                 result["task_description"],
                 result["task_name"],
+                result["initial_bboxes"],
                 {"mode": mode, "seed": candidate_seed, "success": result["success"]},
             )
     raise RuntimeError(

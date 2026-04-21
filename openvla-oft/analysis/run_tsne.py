@@ -29,7 +29,7 @@ from bitvla.constants import (
 
 def analyze_condition(stack, label, suite, mode, task_id, layer_indices, capture_kwargs):
     print(f"\n{'=' * 60}\n[{label}] suite={suite} mode={mode} task={task_id}\n{'=' * 60}")
-    image, task_desc, task_name, meta = common.capture_observation(
+    image, task_desc, task_name, _bboxes, meta = common.capture_observation(
         suite, task_id, mode, stack=stack, **capture_kwargs
     )
     inputs = common.prepare_inputs(stack.model, stack.processor, image, task_desc)

@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 
 import numpy as np
@@ -24,7 +25,7 @@ from bitvla.constants import BITNET_DEFAULT_IMAGE_TOKEN_IDX
 
 def analyze_condition(stack, label, suite, mode, task_id, layer_indices, capture_kwargs):
     print(f"\n{'=' * 60}\n[{label}] suite={suite} mode={mode} task={task_id}\n{'=' * 60}")
-    image, task_desc, task_name, meta = common.capture_observation(
+    image, task_desc, task_name, bboxes, meta = common.capture_observation(
         suite, task_id, mode, stack=stack, **capture_kwargs
     )
     inputs = common.prepare_inputs(stack.model, stack.processor, image, task_desc)
@@ -41,10 +42,41 @@ def analyze_condition(stack, label, suite, mode, task_id, layer_indices, capture
         "label": label,
         "image": np.array(image),
         "attention": image_attention,
+        "bboxes": bboxes,
         "task_description": task_desc,
         "task_name": task_name,
         "meta": meta,
     }
+
+
+def compute_bbox_attention_ratios(image_attention, bboxes, image_shape, patch_grid_size=16):
+    """For each layer + object bbox, fraction of attention mass inside the bbox.
+
+    Attention map has patch_grid_size**2 patches covering the image uniformly; we sum the
+    patch values whose image-space rectangle overlaps the bbox, divided by the total sum.
+    """
+    H, W = image_shape[:2]
+    scale_y = patch_grid_size / H
+    scale_x = patch_grid_size / W
+    results = {}
+    for layer_idx, attn in image_attention.items():
+        attn_grid = attn.float().cpu().numpy().reshape(patch_grid_size, patch_grid_size)
+        total = float(attn_grid.sum())
+        per_object = {}
+        for b in bboxes:
+            ymin, xmin, ymax, xmax = b["bbox"]
+            gy0 = max(int(np.floor(ymin * scale_y)), 0)
+            gy1 = min(int(np.ceil(ymax * scale_y)), patch_grid_size)
+            gx0 = max(int(np.floor(xmin * scale_x)), 0)
+            gx1 = min(int(np.ceil(xmax * scale_x)), patch_grid_size)
+            if gy1 <= gy0 or gx1 <= gx0:
+                ratio = 0.0
+            else:
+                inside = float(attn_grid[gy0:gy1, gx0:gx1].sum())
+                ratio = inside / total if total > 0 else 0.0
+            per_object[b["name"]] = {"ratio": ratio, "is_target": bool(b.get("is_target"))}
+        results[int(layer_idx)] = per_object
+    return results
 
 
 def save_per_condition(result, output_dir, task_id):
@@ -53,7 +85,22 @@ def save_per_condition(result, output_dir, task_id):
         result["attention"],
         task_label=f"{result['task_description']} [{result['label']}]",
         output_path=os.path.join(output_dir, f"layers_{result['label']}_task{task_id}.png"),
+        bboxes=result["bboxes"],
     )
+
+    ratios = compute_bbox_attention_ratios(
+        result["attention"], result["bboxes"], result["image"].shape
+    )
+    scores_path = os.path.join(output_dir, f"scores_{result['label']}_task{task_id}.json")
+    with open(scores_path, "w") as f:
+        json.dump({
+            "label": result["label"],
+            "task_description": result["task_description"],
+            "meta": result["meta"],
+            "bboxes": result["bboxes"],
+            "per_layer_ratios": ratios,
+        }, f, indent=2)
+    print(f"Saved: {scores_path}")
 
 
 def main():
