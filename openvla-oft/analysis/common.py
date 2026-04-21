@@ -225,19 +225,9 @@ def add_common_args(parser):
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--rollout_max_steps", type=int, default=None,
                         help="Max env steps; None → use TASK_MAX_STEPS for the suite.")
-    parser.add_argument("--rollout_seed_candidates", type=int, nargs="*",
-                        default=[7, 13, 21, 42, 100])
-
-
-def _get_task_and_init(suite_name, task_id):
-    from libero.libero import benchmark
-    benchmark_dict = benchmark.get_benchmark_dict()
-    task_suite = benchmark_dict[suite_name]()
-    task = task_suite.get_task(task_id)
-    initial_states = task_suite.get_task_init_states(task_id)
-    if initial_states is None or len(initial_states) == 0:
-        raise RuntimeError(f"No initial states for task {task_id} in suite '{suite_name}'.")
-    return task, initial_states[0], task.language, task.name
+    parser.add_argument("--rollout_init_state_candidates", type=int, nargs="*",
+                        default=list(range(50)),
+                        help="init_state_idx values to try in success/failed mode.")
 
 
 def _make_seg_env(task, resolution=256):
@@ -299,12 +289,27 @@ def _extract_bboxes(env, obs, flip=True):
     return bboxes
 
 
-def _reset_and_capture_initial(suite_name, task_id, seed):
+def _get_initial_state(suite_name, task_id, init_state_idx):
+    from libero.libero import benchmark
+    benchmark_dict = benchmark.get_benchmark_dict()
+    task_suite = benchmark_dict[suite_name]()
+    task = task_suite.get_task(task_id)
+    initial_states = task_suite.get_task_init_states(task_id)
+    if initial_states is None or len(initial_states) == 0:
+        raise RuntimeError(f"No initial states for task {task_id} in suite '{suite_name}'.")
+    if init_state_idx >= len(initial_states):
+        raise IndexError(
+            f"init_state_idx={init_state_idx} out of range for task {task_id} in '{suite_name}' "
+            f"(has {len(initial_states)} initial states)"
+        )
+    return task, initial_states[init_state_idx], task.language, task.name
+
+
+def _reset_and_capture_initial(suite_name, task_id, init_state_idx):
     from experiments.robot.libero.libero_utils import get_libero_image
-    task, init_state, task_description, task_name = _get_task_and_init(suite_name, task_id)
+    task, init_state, task_description, task_name = _get_initial_state(suite_name, task_id, init_state_idx)
     env = _make_seg_env(task, resolution=256)
     try:
-        env.seed(seed)
         env.reset()
         env.set_init_state(init_state)
         obs = env.step(np.zeros(7))[0]
@@ -345,12 +350,14 @@ def _resolve_capture_steps(max_steps, override=None):
     return filtered
 
 
-def _run_rollout(stack: RolloutStack, suite_name, task_id, seed, max_steps, capture_steps):
+def _run_rollout(stack: RolloutStack, suite_name, task_id, init_state_idx, max_steps, capture_steps):
     """Run a rollout, collecting image+bbox at every requested frame.
 
-    capture_steps: dict {frame_name: step_idx}. Frames that the rollout never
-    reaches (rollout terminates early) are filled from the final captured
-    observation and tagged with fallback=True.
+    init_state_idx selects one of the ~50 pre-recorded initial states for the task —
+    matches the LIBERO eval protocol (deterministic across runs, varies starting
+    pose / object placement rather than env dynamics). capture_steps: dict
+    {frame_name: step_idx}. Frames the rollout never reaches are filled from the
+    final captured observation and tagged with fallback=True.
     """
     from experiments.robot.libero.libero_utils import (
         get_libero_image,
@@ -363,7 +370,7 @@ def _run_rollout(stack: RolloutStack, suite_name, task_id, seed, max_steps, capt
     )
     from experiments.robot.robot_utils import get_action
 
-    task, init_state, task_description, task_name = _get_task_and_init(suite_name, task_id)
+    task, init_state, task_description, task_name = _get_initial_state(suite_name, task_id, init_state_idx)
     cfg = stack.cfg
     cfg.task_suite_name = suite_name
     if max_steps is None:
@@ -375,7 +382,6 @@ def _run_rollout(stack: RolloutStack, suite_name, task_id, seed, max_steps, capt
     action_queue = deque(maxlen=cfg.num_open_loop_steps)
     success = False
     try:
-        env.seed(seed)
         env.reset()
         obs = env.set_init_state(init_state)
         t = 0
@@ -434,25 +440,31 @@ def _run_rollout(stack: RolloutStack, suite_name, task_id, seed, max_steps, capt
 def capture_frames(
     suite_name, task_id, mode="initial", *,
     stack: RolloutStack = None,
-    seed=7,
+    init_state_idx=0,
     rollout_max_steps=None,
-    rollout_seed_candidates=(7, 13, 21, 42, 100),
+    rollout_init_state_candidates=tuple(range(50)),
     capture_steps=None,
 ):
     """Return {task_description, task_name, meta, frames:{frame_name: {image, bboxes, step_idx}}}.
 
+    init_state_idx selects one of the pre-recorded starting states for the task,
+    matching LIBERO's eval protocol (vs. randomizing env.seed on a fixed state).
+
     Modes:
       initial     : returns a single frame at t=0 without running the policy.
-      success     : runs rollouts until one succeeds; returns all 4 frames.
-      failed      : runs rollouts until one fails; returns all 4 frames.
-      mid_rollout : runs one rollout with `seed`; returns all 4 frames regardless.
+      success     : tries init_state_idx values from rollout_init_state_candidates
+                    until one succeeds; returns all 4 frames.
+      failed      : same but for a failed rollout.
+      mid_rollout : runs one rollout with the given init_state_idx; returns all 4 frames.
     """
     if mode == "initial":
-        image, task_desc, task_name, bboxes = _reset_and_capture_initial(suite_name, task_id, seed)
+        image, task_desc, task_name, bboxes = _reset_and_capture_initial(
+            suite_name, task_id, init_state_idx
+        )
         return {
             "task_description": task_desc,
             "task_name": task_name,
-            "meta": {"mode": mode, "seed": seed},
+            "meta": {"mode": mode, "init_state_idx": init_state_idx},
             "frames": {"t=0": {"image": np.array(image), "bboxes": bboxes, "step_idx": 0}},
         }
 
@@ -480,19 +492,20 @@ def capture_frames(
         }
 
     if mode == "mid_rollout":
-        result = _run_rollout(stack, suite_name, task_id, seed, max_steps, steps)
-        return _package(result, {"mode": mode, "seed": seed, "success": result["success"],
+        result = _run_rollout(stack, suite_name, task_id, init_state_idx, max_steps, steps)
+        return _package(result, {"mode": mode, "init_state_idx": init_state_idx,
+                                  "success": result["success"],
                                   "final_step_idx": result["final_step_idx"]})
 
     target_success = (mode == "success")
-    for candidate_seed in rollout_seed_candidates:
-        print(f"  trying seed={candidate_seed} for mode={mode}...")
-        result = _run_rollout(stack, suite_name, task_id, candidate_seed, max_steps, steps)
+    for candidate in rollout_init_state_candidates:
+        print(f"  trying init_state_idx={candidate} for mode={mode}...")
+        result = _run_rollout(stack, suite_name, task_id, candidate, max_steps, steps)
         if result["success"] == target_success:
-            return _package(result, {"mode": mode, "seed": candidate_seed,
+            return _package(result, {"mode": mode, "init_state_idx": candidate,
                                       "success": result["success"],
                                       "final_step_idx": result["final_step_idx"]})
     raise RuntimeError(
-        f"No rollout seed in {list(rollout_seed_candidates)} produced outcome '{mode}' "
+        f"No init_state_idx in {list(rollout_init_state_candidates)} produced outcome '{mode}' "
         f"for suite '{suite_name}' task {task_id}."
     )

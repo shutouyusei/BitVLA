@@ -65,8 +65,8 @@ def _atomic_json_dump(path, payload):
     os.replace(tmp, path)
 
 
-def _episode_path(episodes_dir, label, task_id, seed):
-    return os.path.join(episodes_dir, f"{label}_task{task_id}_seed{seed}.json")
+def _episode_path(episodes_dir, label, task_id, init_state_idx):
+    return os.path.join(episodes_dir, f"{label}_task{task_id}_init{init_state_idx}.json")
 
 
 def _build_frame_entry(attn, fr, include_siglip):
@@ -92,12 +92,14 @@ def _build_frame_entry(attn, fr, include_siglip):
 
 
 def _build_pairs(args, target_outcome):
-    """Build the ordered list of (task_id, seed) candidates to try.
+    """Build the ordered list of (task_id, init_state_idx) candidates to try.
 
-    Precedence: --seeds_from > explicit --task_ids × --seeds > --task_ids × range(--n_seeds_per_task).
+    Precedence:
+      --init_states_from > explicit --task_ids × --init_state_indices
+      > --task_ids × range(--n_init_states_per_task).
     """
-    if args.seeds_from:
-        with open(args.seeds_from) as f:
+    if args.init_states_from:
+        with open(args.init_states_from) as f:
             prescreen = json.load(f)
         records = prescreen.get("records", [])
         want_success = {"success": True, "failed": False}.get(target_outcome)
@@ -105,22 +107,23 @@ def _build_pairs(args, target_outcome):
             filtered = records
         else:
             filtered = [r for r in records if bool(r.get("success")) == want_success]
-        pairs = [(r["task_id"], r["seed"]) for r in filtered]
+        pairs = [(r["task_id"], r["init_state_idx"]) for r in filtered]
         print(f"Loaded {len(pairs)} prescreen pairs matching outcome={target_outcome} "
-              f"from {args.seeds_from}")
+              f"from {args.init_states_from}")
         return pairs
 
-    if args.seeds:
-        seeds = args.seeds
-    elif args.n_seeds_per_task:
-        seeds = list(range(args.n_seeds_per_task))
+    if args.init_state_indices:
+        indices = args.init_state_indices
+    elif args.n_init_states_per_task:
+        indices = list(range(args.n_init_states_per_task))
     else:
         raise SystemExit(
-            "Provide one of --seeds_from, --seeds, or --n_seeds_per_task (with --task_ids)."
+            "Provide one of --init_states_from, --init_state_indices, "
+            "or --n_init_states_per_task (with --task_ids)."
         )
     if not args.task_ids:
-        raise SystemExit("--task_ids is required unless --seeds_from is used.")
-    return [(t, s) for t in args.task_ids for s in seeds]
+        raise SystemExit("--task_ids is required unless --init_states_from is used.")
+    return [(t, i) for t in args.task_ids for i in indices]
 
 
 def run_collect(args, stack, layer_indices, siglip_layer_indices, episodes_dir, png_dir):
@@ -151,18 +154,19 @@ def run_collect(args, stack, layer_indices, siglip_layer_indices, episodes_dir, 
 
     attempts = 0
     collected_set = set(collected)
-    for task_id, seed in pairs:
+    for task_id, init_state_idx in pairs:
         if len(collected) >= args.n:
             break
-        if (task_id, seed) in collected_set:
+        if (task_id, init_state_idx) in collected_set:
             continue
-        path = _episode_path(episodes_dir, label, task_id, seed)
+        path = _episode_path(episodes_dir, label, task_id, init_state_idx)
 
         attempts += 1
-        print(f"\n[{len(collected)}/{args.n}] task={task_id} seed={seed} (attempt {attempts})")
+        print(f"\n[{len(collected)}/{args.n}] task={task_id} init={init_state_idx} (attempt {attempts})")
         try:
             capture = common.capture_frames(
-                suite, task_id, "mid_rollout", stack=stack, seed=seed,
+                suite, task_id, "mid_rollout", stack=stack,
+                init_state_idx=init_state_idx,
                 rollout_max_steps=args.rollout_max_steps,
             )
         except Exception as e:
@@ -188,7 +192,7 @@ def run_collect(args, stack, layer_indices, siglip_layer_indices, episodes_dir, 
                     fr["image"], attn["attention"],
                     task_label=f"{capture['task_description']} [{label}/{frame_name}] (LLM)",
                     output_path=os.path.join(
-                        png_dir, f"layers_{label}_task{task_id}_seed{seed}_{tag}.png"),
+                        png_dir, f"layers_{label}_task{task_id}_init{init_state_idx}_{tag}.png"),
                     bboxes=fr["bboxes"],
                 )
                 if args.include_siglip:
@@ -196,14 +200,14 @@ def run_collect(args, stack, layer_indices, siglip_layer_indices, episodes_dir, 
                         fr["image"], attn["siglip_attention"],
                         task_label=f"{capture['task_description']} [{label}/{frame_name}] (SigLIP)",
                         output_path=os.path.join(
-                            png_dir, f"layers_siglip_{label}_task{task_id}_seed{seed}_{tag}.png"),
+                            png_dir, f"layers_siglip_{label}_task{task_id}_init{init_state_idx}_{tag}.png"),
                         bboxes=fr["bboxes"],
                     )
 
         payload = {
             "label": label,
             "task_id": task_id,
-            "seed": seed,
+            "init_state_idx": init_state_idx,
             "suite": suite,
             "task_description": capture["task_description"],
             "task_name": capture["task_name"],
@@ -211,8 +215,8 @@ def run_collect(args, stack, layer_indices, siglip_layer_indices, episodes_dir, 
             "frames": frames_payload,
         }
         _atomic_json_dump(path, payload)
-        collected.append((task_id, seed))
-        collected_set.add((task_id, seed))
+        collected.append((task_id, init_state_idx))
+        collected_set.add((task_id, init_state_idx))
         print(f"  saved {os.path.basename(path)}  [{len(collected)}/{args.n}]")
 
     print(f"\nCollected {len(collected)}/{args.n} for {label} (attempted {attempts} new rollouts).")
@@ -224,7 +228,7 @@ def run_collect(args, stack, layer_indices, siglip_layer_indices, episodes_dir, 
 
 
 def run_prescreen(args, stack, out_path):
-    """Run rollouts only, record {task_id, seed, success}. No attention extraction."""
+    """Run rollouts only, record {task_id, init_state_idx, success}. No attention extraction."""
     existing = {}
     if os.path.exists(out_path):
         try:
@@ -235,20 +239,21 @@ def run_prescreen(args, stack, out_path):
     results = existing if isinstance(existing, dict) else {}
     results.setdefault("suite", args.suite)
     results.setdefault("records", [])
-    done_pairs = {(r["task_id"], r["seed"]) for r in results["records"]}
+    done_pairs = {(r["task_id"], r["init_state_idx"]) for r in results["records"]}
 
     suite = args.suite
-    total = len(args.task_ids) * len(args.seeds)
+    total = len(args.task_ids) * len(args.init_state_indices)
     done = len(done_pairs)
     for task_id in args.task_ids:
-        for seed in args.seeds:
-            if (task_id, seed) in done_pairs:
+        for init_state_idx in args.init_state_indices:
+            if (task_id, init_state_idx) in done_pairs:
                 continue
             done += 1
-            print(f"[{done}/{total}] task={task_id} seed={seed} ...", end=" ", flush=True)
+            print(f"[{done}/{total}] task={task_id} init={init_state_idx} ...", end=" ", flush=True)
             try:
                 capture = common.capture_frames(
-                    suite, task_id, "mid_rollout", stack=stack, seed=seed,
+                    suite, task_id, "mid_rollout", stack=stack,
+                    init_state_idx=init_state_idx,
                     rollout_max_steps=args.rollout_max_steps,
                 )
                 success = bool(capture["meta"]["success"])
@@ -258,7 +263,7 @@ def run_prescreen(args, stack, out_path):
                 continue
             print(f"success={success} final_step={final_step}")
             results["records"].append({
-                "task_id": task_id, "seed": seed,
+                "task_id": task_id, "init_state_idx": init_state_idx,
                 "success": success, "final_step_idx": final_step,
             })
             _atomic_json_dump(out_path, results)
@@ -279,15 +284,16 @@ def main():
     parser.add_argument("--output_subdir", type=str, default=None,
                         help="Subdir under --output_dir (default: today's date).")
     parser.add_argument("--task_ids", type=int, nargs="+", default=None,
-                        help="Task IDs to iterate. Required unless --seeds_from is used.")
-    parser.add_argument("--seeds", type=int, nargs="+", default=None,
-                        help="Explicit seed list. Alternative: --n_seeds_per_task or --seeds_from.")
-    parser.add_argument("--n_seeds_per_task", type=int, default=None,
-                        help="Shorthand for seeds = range(N). Ignored when --seeds is given.")
-    parser.add_argument("--seeds_from", type=str, default=None,
+                        help="Task IDs to iterate. Required unless --init_states_from is used.")
+    parser.add_argument("--init_state_indices", type=int, nargs="+", default=None,
+                        help="Explicit init_state_idx list (0..len(initial_states)-1).")
+    parser.add_argument("--n_init_states_per_task", type=int, default=None,
+                        help="Shorthand for init_state_indices = range(N). Ignored when "
+                             "--init_state_indices is given.")
+    parser.add_argument("--init_states_from", type=str, default=None,
                         help="Path to a prescreen JSON (from --mode prescreen). Restricts (task, "
-                             "seed) candidates to records whose success flag matches the condition "
-                             "outcome. Only used in collect mode.")
+                             "init_state_idx) candidates to records whose success flag matches "
+                             "the condition outcome. Only used in collect mode.")
     parser.add_argument("--rollout_max_steps", type=int, default=None)
 
     # Collect-mode args
@@ -338,13 +344,12 @@ def main():
     else:  # prescreen
         if args.suite is None or args.prescreen_output is None:
             parser.error("--suite and --prescreen_output are required for prescreen mode")
-        if args.task_ids is None or args.seeds is None:
-            if args.task_ids is None:
-                parser.error("--task_ids is required for prescreen mode")
-            if args.seeds is None and args.n_seeds_per_task is None:
-                parser.error("Provide --seeds or --n_seeds_per_task for prescreen mode")
-        if args.seeds is None and args.n_seeds_per_task is not None:
-            args.seeds = list(range(args.n_seeds_per_task))
+        if args.task_ids is None:
+            parser.error("--task_ids is required for prescreen mode")
+        if args.init_state_indices is None and args.n_init_states_per_task is None:
+            parser.error("Provide --init_state_indices or --n_init_states_per_task for prescreen mode")
+        if args.init_state_indices is None:
+            args.init_state_indices = list(range(args.n_init_states_per_task))
         run_prescreen(args, stack, args.prescreen_output)
 
 
