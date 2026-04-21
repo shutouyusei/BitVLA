@@ -81,7 +81,13 @@ def summarize_values(values_by_layer):
 
 
 def mann_whitney_with_effect(x, y):
-    """Two-sided Mann-Whitney U, asymptotic. Returns {u, p, z, r, n1, n2}."""
+    """Two-sided Mann-Whitney U, asymptotic (tie-corrected).
+
+    Returns {u, p, z, r, n1, n2}. z is derived from scipy's tie-corrected p-value
+    (z = Φ⁻¹(1 − p/2) with sign from U − n1·n2/2) so r = |z| / √(n1 + n2) remains
+    consistent with p under rank ties. The untied closed-form overstates |z| and
+    therefore r when many values tie (e.g. zero-attention bboxes).
+    """
     x = np.asarray([v for v in x if not (isinstance(v, float) and math.isnan(v))])
     y = np.asarray([v for v in y if not (isinstance(v, float) and math.isnan(v))])
     n1, n2 = int(x.size), int(y.size)
@@ -91,9 +97,14 @@ def mann_whitney_with_effect(x, y):
     u = float(res.statistic)
     p = float(res.pvalue)
     mean_u = n1 * n2 / 2.0
-    std_u = math.sqrt(n1 * n2 * (n1 + n2 + 1) / 12.0)
-    z = (u - mean_u) / std_u if std_u > 0 else 0.0
-    r = abs(z) / math.sqrt(n1 + n2)
+    sign = 1.0 if u > mean_u else (-1.0 if u < mean_u else 0.0)
+    if p <= 0.0:
+        z = sign * float("inf")
+    elif p >= 1.0:
+        z = 0.0
+    else:
+        z = sign * float(stats.norm.isf(p / 2.0))
+    r = abs(z) / math.sqrt(n1 + n2) if math.isfinite(z) else float("inf")
     return {"u": u, "p": p, "z": float(z), "r": float(r), "n1": n1, "n2": n2}
 
 

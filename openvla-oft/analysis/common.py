@@ -278,6 +278,10 @@ def _extract_bboxes(env, obs, flip=True):
         seg = seg[::-1, ::-1]
     target_names = set(getattr(env, "obj_of_interest", None) or [])
     bboxes = []
+    # LIBERO's SegmentationRenderEnv stores instance IDs starting at 0 in
+    # segmentation_id_mapping, but the rendered segmentation image uses 1-based
+    # IDs (see SegmentationRenderEnv.get_segmentation_instances, which compares
+    # `segmentation_image == seg_id + 1`). ID 0 in the image means background.
     for inst_id, name in env.segmentation_id_mapping.items():
         mask = (seg == inst_id + 1)
         if not mask.any():

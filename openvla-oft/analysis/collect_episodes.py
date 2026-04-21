@@ -94,7 +94,7 @@ def run_collect(args, stack, layer_indices, siglip_layer_indices, episodes_dir, 
     label, suite, target_outcome = _parse_condition(args.condition)
     print(f"Condition: label={label} suite={suite} outcome={target_outcome} target N={args.n}")
 
-    # Resume: count existing matching episodes
+    # Resume: count existing matching episodes (tolerant of legacy schemas)
     collected = []
     for task_id in args.task_ids:
         for seed in args.seeds:
@@ -103,10 +103,12 @@ def run_collect(args, stack, layer_indices, siglip_layer_indices, episodes_dir, 
                 continue
             try:
                 ep = json.load(open(path))
-                if _matches_target(ep["meta"].get("success"), target_outcome):
-                    collected.append((task_id, seed))
             except (OSError, json.JSONDecodeError):
+                print(f"  warn: skipping unreadable {os.path.basename(path)}")
                 continue
+            success = (ep.get("meta") or {}).get("success")
+            if _matches_target(success, target_outcome):
+                collected.append((task_id, seed))
     if collected:
         print(f"Resume: {len(collected)} matching episodes already on disk.")
     if len(collected) >= args.n:
