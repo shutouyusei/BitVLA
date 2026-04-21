@@ -28,6 +28,7 @@ Usage:
 import argparse
 import json
 import os
+import sys
 
 from analysis import common
 from analysis.run_attention import (
@@ -90,99 +91,136 @@ def _build_frame_entry(attn, fr, include_siglip):
     return entry
 
 
+def _build_pairs(args, target_outcome):
+    """Build the ordered list of (task_id, seed) candidates to try.
+
+    Precedence: --seeds_from > explicit --task_ids × --seeds > --task_ids × range(--n_seeds_per_task).
+    """
+    if args.seeds_from:
+        with open(args.seeds_from) as f:
+            prescreen = json.load(f)
+        records = prescreen.get("records", [])
+        want_success = {"success": True, "failed": False}.get(target_outcome)
+        if want_success is None:
+            filtered = records
+        else:
+            filtered = [r for r in records if bool(r.get("success")) == want_success]
+        pairs = [(r["task_id"], r["seed"]) for r in filtered]
+        print(f"Loaded {len(pairs)} prescreen pairs matching outcome={target_outcome} "
+              f"from {args.seeds_from}")
+        return pairs
+
+    if args.seeds:
+        seeds = args.seeds
+    elif args.n_seeds_per_task:
+        seeds = list(range(args.n_seeds_per_task))
+    else:
+        raise SystemExit(
+            "Provide one of --seeds_from, --seeds, or --n_seeds_per_task (with --task_ids)."
+        )
+    if not args.task_ids:
+        raise SystemExit("--task_ids is required unless --seeds_from is used.")
+    return [(t, s) for t in args.task_ids for s in seeds]
+
+
 def run_collect(args, stack, layer_indices, siglip_layer_indices, episodes_dir, png_dir):
     label, suite, target_outcome = _parse_condition(args.condition)
     print(f"Condition: label={label} suite={suite} outcome={target_outcome} target N={args.n}")
 
+    pairs = _build_pairs(args, target_outcome)
+
     # Resume: count existing matching episodes (tolerant of legacy schemas)
     collected = []
-    for task_id in args.task_ids:
-        for seed in args.seeds:
-            path = _episode_path(episodes_dir, label, task_id, seed)
-            if not os.path.exists(path):
-                continue
-            try:
-                ep = json.load(open(path))
-            except (OSError, json.JSONDecodeError):
-                print(f"  warn: skipping unreadable {os.path.basename(path)}")
-                continue
-            success = (ep.get("meta") or {}).get("success")
-            if _matches_target(success, target_outcome):
-                collected.append((task_id, seed))
+    for task_id, seed in pairs:
+        path = _episode_path(episodes_dir, label, task_id, seed)
+        if not os.path.exists(path):
+            continue
+        try:
+            ep = json.load(open(path))
+        except (OSError, json.JSONDecodeError):
+            print(f"  warn: skipping unreadable {os.path.basename(path)}")
+            continue
+        success = (ep.get("meta") or {}).get("success")
+        if _matches_target(success, target_outcome):
+            collected.append((task_id, seed))
     if collected:
         print(f"Resume: {len(collected)} matching episodes already on disk.")
     if len(collected) >= args.n:
         print("Target already met — nothing to do.")
-        return
+        return 0
 
     attempts = 0
-    for task_id in args.task_ids:
-        for seed in args.seeds:
-            if len(collected) >= args.n:
-                break
-            if (task_id, seed) in collected:
-                continue
-            path = _episode_path(episodes_dir, label, task_id, seed)
-
-            attempts += 1
-            print(f"\n[{len(collected)}/{args.n}] task={task_id} seed={seed} (attempt {attempts})")
-            try:
-                capture = common.capture_frames(
-                    suite, task_id, "mid_rollout", stack=stack, seed=seed,
-                    rollout_max_steps=args.rollout_max_steps,
-                )
-            except Exception as e:
-                print(f"  rollout errored: {e}")
-                continue
-
-            success = capture["meta"]["success"]
-            if not _matches_target(success, target_outcome):
-                print(f"  outcome={success}, want {target_outcome} — skip")
-                continue
-
-            print(f"  matched, running attention analysis on {len(capture['frames'])} frames...")
-            frames_payload = {}
-            for frame_name, fr in capture["frames"].items():
-                attn = analyze_frame(
-                    stack, fr["image"], capture["task_description"],
-                    layer_indices, args.include_siglip, siglip_layer_indices,
-                )
-                frames_payload[frame_name] = _build_frame_entry(attn, fr, args.include_siglip)
-                if args.save_png:
-                    tag = _frame_suffix(frame_name)
-                    visualize_all_layers(
-                        fr["image"], attn["attention"],
-                        task_label=f"{capture['task_description']} [{label}/{frame_name}] (LLM)",
-                        output_path=os.path.join(
-                            png_dir, f"layers_{label}_task{task_id}_seed{seed}_{tag}.png"),
-                        bboxes=fr["bboxes"],
-                    )
-                    if args.include_siglip:
-                        visualize_all_layers(
-                            fr["image"], attn["siglip_attention"],
-                            task_label=f"{capture['task_description']} [{label}/{frame_name}] (SigLIP)",
-                            output_path=os.path.join(
-                                png_dir, f"layers_siglip_{label}_task{task_id}_seed{seed}_{tag}.png"),
-                            bboxes=fr["bboxes"],
-                        )
-
-            payload = {
-                "label": label,
-                "task_id": task_id,
-                "seed": seed,
-                "suite": suite,
-                "task_description": capture["task_description"],
-                "task_name": capture["task_name"],
-                "meta": capture["meta"],
-                "frames": frames_payload,
-            }
-            _atomic_json_dump(path, payload)
-            collected.append((task_id, seed))
-            print(f"  saved {os.path.basename(path)}  [{len(collected)}/{args.n}]")
+    collected_set = set(collected)
+    for task_id, seed in pairs:
         if len(collected) >= args.n:
             break
+        if (task_id, seed) in collected_set:
+            continue
+        path = _episode_path(episodes_dir, label, task_id, seed)
+
+        attempts += 1
+        print(f"\n[{len(collected)}/{args.n}] task={task_id} seed={seed} (attempt {attempts})")
+        try:
+            capture = common.capture_frames(
+                suite, task_id, "mid_rollout", stack=stack, seed=seed,
+                rollout_max_steps=args.rollout_max_steps,
+            )
+        except Exception as e:
+            print(f"  rollout errored: {e}")
+            continue
+
+        success = capture["meta"]["success"]
+        if not _matches_target(success, target_outcome):
+            print(f"  outcome={success}, want {target_outcome} — skip")
+            continue
+
+        print(f"  matched, running attention analysis on {len(capture['frames'])} frames...")
+        frames_payload = {}
+        for frame_name, fr in capture["frames"].items():
+            attn = analyze_frame(
+                stack, fr["image"], capture["task_description"],
+                layer_indices, args.include_siglip, siglip_layer_indices,
+            )
+            frames_payload[frame_name] = _build_frame_entry(attn, fr, args.include_siglip)
+            if args.save_png:
+                tag = _frame_suffix(frame_name)
+                visualize_all_layers(
+                    fr["image"], attn["attention"],
+                    task_label=f"{capture['task_description']} [{label}/{frame_name}] (LLM)",
+                    output_path=os.path.join(
+                        png_dir, f"layers_{label}_task{task_id}_seed{seed}_{tag}.png"),
+                    bboxes=fr["bboxes"],
+                )
+                if args.include_siglip:
+                    visualize_all_layers(
+                        fr["image"], attn["siglip_attention"],
+                        task_label=f"{capture['task_description']} [{label}/{frame_name}] (SigLIP)",
+                        output_path=os.path.join(
+                            png_dir, f"layers_siglip_{label}_task{task_id}_seed{seed}_{tag}.png"),
+                        bboxes=fr["bboxes"],
+                    )
+
+        payload = {
+            "label": label,
+            "task_id": task_id,
+            "seed": seed,
+            "suite": suite,
+            "task_description": capture["task_description"],
+            "task_name": capture["task_name"],
+            "meta": capture["meta"],
+            "frames": frames_payload,
+        }
+        _atomic_json_dump(path, payload)
+        collected.append((task_id, seed))
+        collected_set.add((task_id, seed))
+        print(f"  saved {os.path.basename(path)}  [{len(collected)}/{args.n}]")
 
     print(f"\nCollected {len(collected)}/{args.n} for {label} (attempted {attempts} new rollouts).")
+    if len(collected) < args.n:
+        print(f"WARN: target not met ({len(collected)}/{args.n}). Add more candidate pairs "
+              f"via --seeds_from, --seeds, or --n_seeds_per_task, then re-run to resume.")
+        return 1
+    return 0
 
 
 def run_prescreen(args, stack, out_path):
@@ -240,8 +278,16 @@ def main():
     parser.add_argument("--output_dir", type=str, default="./analysis_output")
     parser.add_argument("--output_subdir", type=str, default=None,
                         help="Subdir under --output_dir (default: today's date).")
-    parser.add_argument("--task_ids", type=int, nargs="+", required=True)
-    parser.add_argument("--seeds", type=int, nargs="+", required=True)
+    parser.add_argument("--task_ids", type=int, nargs="+", default=None,
+                        help="Task IDs to iterate. Required unless --seeds_from is used.")
+    parser.add_argument("--seeds", type=int, nargs="+", default=None,
+                        help="Explicit seed list. Alternative: --n_seeds_per_task or --seeds_from.")
+    parser.add_argument("--n_seeds_per_task", type=int, default=None,
+                        help="Shorthand for seeds = range(N). Ignored when --seeds is given.")
+    parser.add_argument("--seeds_from", type=str, default=None,
+                        help="Path to a prescreen JSON (from --mode prescreen). Restricts (task, "
+                             "seed) candidates to records whose success flag matches the condition "
+                             "outcome. Only used in collect mode.")
     parser.add_argument("--rollout_max_steps", type=int, default=None)
 
     # Collect-mode args
@@ -287,11 +333,18 @@ def main():
             siglip_layer_indices, n_siglip = common.default_siglip_layer_indices(stack.model)
             print(f"SigLIP layers: all {n_siglip}")
 
-        run_collect(args, stack, layer_indices, siglip_layer_indices, episodes_dir, png_dir)
+        sys.exit(run_collect(args, stack, layer_indices, siglip_layer_indices, episodes_dir, png_dir))
 
     else:  # prescreen
         if args.suite is None or args.prescreen_output is None:
             parser.error("--suite and --prescreen_output are required for prescreen mode")
+        if args.task_ids is None or args.seeds is None:
+            if args.task_ids is None:
+                parser.error("--task_ids is required for prescreen mode")
+            if args.seeds is None and args.n_seeds_per_task is None:
+                parser.error("Provide --seeds or --n_seeds_per_task for prescreen mode")
+        if args.seeds is None and args.n_seeds_per_task is not None:
+            args.seeds = list(range(args.n_seeds_per_task))
         run_prescreen(args, stack, args.prescreen_output)
 
 

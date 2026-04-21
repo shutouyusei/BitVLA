@@ -319,7 +319,12 @@ PHASE1_CAPTURE_STEPS = {"t=0": 0, "t=max//3": None, "step=100": 100, "t=max-1": 
 
 
 def _resolve_capture_steps(max_steps, override=None):
-    """Return concrete {frame_name: step_idx} for a given rollout length."""
+    """Return concrete {frame_name: step_idx} for a given rollout length.
+
+    Drops (with a warning) any frame whose target step is unreachable for the
+    given max_steps so downstream aggregators do not silently count fallback
+    duplicates toward sample counts.
+    """
     steps = dict(override or PHASE1_CAPTURE_STEPS)
     resolved = {}
     for name, raw in steps.items():
@@ -329,7 +334,15 @@ def _resolve_capture_steps(max_steps, override=None):
             resolved[name] = max_steps - 1
         else:
             resolved[name] = raw
-    return resolved
+    filtered = {}
+    for name, step in resolved.items():
+        if step is None:
+            continue
+        if step >= max_steps and name != "t=max-1":
+            print(f"warn: dropping capture frame '{name}' (step={step} >= max_steps={max_steps})")
+            continue
+        filtered[name] = step
+    return filtered
 
 
 def _run_rollout(stack: RolloutStack, suite_name, task_id, seed, max_steps, capture_steps):
