@@ -37,7 +37,11 @@ from analysis.run_attention import (
     compute_bbox_attention_ratios_per_head,
     _frame_suffix,
 )
-from analysis.visualize_attention import visualize_all_layers
+from analysis.visualize_attention import save_single_layer_png, visualize_all_layers
+
+
+DEFAULT_PAPER_LAYERS_LLM = [0, 5, 10, 15, 20, 25, 29]
+DEFAULT_PAPER_LAYERS_SIGLIP = [0, 5, 10, 15, 20, 25]
 
 
 def _parse_condition(spec):
@@ -188,21 +192,38 @@ def run_collect(args, stack, layer_indices, siglip_layer_indices, episodes_dir, 
             frames_payload[frame_name] = _build_frame_entry(attn, fr, args.include_siglip)
             if args.save_png:
                 tag = _frame_suffix(frame_name)
-                visualize_all_layers(
-                    fr["image"], attn["attention"],
-                    task_label=f"{capture['task_description']} [{label}/{frame_name}] (LLM)",
-                    output_path=os.path.join(
-                        png_dir, f"layers_{label}_task{task_id}_init{init_state_idx}_{tag}.png"),
-                    bboxes=fr["bboxes"],
+                base_title = f"{capture['task_description']} [{label}/{frame_name}]"
+                ep_dir = os.path.join(
+                    png_dir, label, f"task{task_id}_init{init_state_idx}",
                 )
+
+                # Layout:
+                #   <ep_dir>/paper/<side>/<frame>.png
+                #   <ep_dir>/layers/<side>/<frame>/L<NN>.png
+                sides = [("llm", attn["attention"], args.paper_layers_llm)]
                 if args.include_siglip:
+                    sides.append(("siglip", attn["siglip_attention"], args.paper_layers_siglip))
+
+                for side_name, attn_dict, paper_layers in sides:
+                    paper_dir = os.path.join(ep_dir, "paper", side_name)
+                    layers_dir = os.path.join(ep_dir, "layers", side_name, tag)
+                    os.makedirs(paper_dir, exist_ok=True)
+                    os.makedirs(layers_dir, exist_ok=True)
+
                     visualize_all_layers(
-                        fr["image"], attn["siglip_attention"],
-                        task_label=f"{capture['task_description']} [{label}/{frame_name}] (SigLIP)",
-                        output_path=os.path.join(
-                            png_dir, f"layers_siglip_{label}_task{task_id}_init{init_state_idx}_{tag}.png"),
+                        fr["image"], attn_dict,
+                        task_label=f"{base_title} ({side_name.upper()})",
+                        output_path=os.path.join(paper_dir, f"{tag}.png"),
                         bboxes=fr["bboxes"],
+                        layer_indices=paper_layers,
                     )
+                    for layer_idx, attn_vec in attn_dict.items():
+                        save_single_layer_png(
+                            fr["image"], attn_vec, int(layer_idx),
+                            output_path=os.path.join(layers_dir, f"L{int(layer_idx):02d}.png"),
+                            bboxes=fr["bboxes"],
+                            title=f"{label}/{frame_name} {side_name.upper()} L{int(layer_idx)}",
+                        )
 
         payload = {
             "label": label,
@@ -311,7 +332,15 @@ def main():
     parser.add_argument("--siglip_layers", type=int, nargs="*", default=None)
     parser.add_argument("--include_siglip", action="store_true")
     parser.add_argument("--save_png", action="store_true",
-                        help="Save per-frame attention PNG alongside the JSON (adds disk usage).")
+                        help="Save per-frame attention PNGs alongside the JSON. "
+                             "Produces <episode>/paper/ grid PNGs and <episode>/layers/ "
+                             "per-layer PNGs.")
+    parser.add_argument("--paper_layers_llm", type=int, nargs="+",
+                        default=DEFAULT_PAPER_LAYERS_LLM,
+                        help="LLM layer indices shown in the paper-ready grid.")
+    parser.add_argument("--paper_layers_siglip", type=int, nargs="+",
+                        default=DEFAULT_PAPER_LAYERS_SIGLIP,
+                        help="SigLIP layer indices shown in the paper-ready grid.")
 
     # Prescreen-mode args
     parser.add_argument("--suite", type=str, default=None,

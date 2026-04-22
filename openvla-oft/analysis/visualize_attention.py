@@ -142,6 +142,29 @@ def compare_attention_maps(
     print(f"Saved: {output_path}")
 
 
+def save_single_layer_png(
+    image: np.ndarray,
+    attention_over_patches,
+    layer_idx: int,
+    output_path: str,
+    patch_grid_size: int = 16,
+    bboxes=None,
+    title: str = None,
+) -> None:
+    """One-layer attention heatmap saved as its own PNG. For per-layer PNG outputs."""
+    fig, ax = plt.subplots(1, 1, figsize=(4, 4))
+    visualize_attention_on_image(
+        image, attention_over_patches,
+        patch_grid_size=patch_grid_size,
+        ax=ax,
+        title=title if title is not None else f"Layer {layer_idx}",
+        bboxes=bboxes,
+    )
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def visualize_all_layers(
     image: np.ndarray,
     attention_maps: dict,
@@ -150,6 +173,7 @@ def visualize_all_layers(
     patch_grid_size: int = 16,
     max_layers: int = 12,
     bboxes=None,
+    layer_indices: list = None,
 ) -> None:
     """
     Grid visualization of attention maps across multiple layers.
@@ -164,8 +188,13 @@ def visualize_all_layers(
         patch_grid_size: sqrt(num_patches)
         max_layers: maximum number of layers to show
     """
-    layer_indices = sorted(attention_maps.keys())[:max_layers]
+    if layer_indices is None:
+        layer_indices = sorted(attention_maps.keys())[:max_layers]
+    else:
+        layer_indices = [l for l in layer_indices if l in attention_maps]
     n = len(layer_indices)
+    if n == 0:
+        return
     cols = min(4, n)
     rows = math.ceil(n / cols)
 
