@@ -190,7 +190,8 @@ def main():
             "label": label,
             "n_episodes": len(episodes),
             "task_ids": sorted({ep["task_id"] for ep in episodes}),
-            "seeds": sorted({ep["seed"] for ep in episodes}),
+            "init_state_indices": sorted({ep.get("init_state_idx") for ep in episodes
+                                          if "init_state_idx" in ep}),
             "frames": summarized,
         }
         out_path = os.path.join(args.output_dir, f"aggregated_{label}.json")
